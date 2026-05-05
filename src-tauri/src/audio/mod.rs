@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod devices;
 
 use serde::Serialize;
 use std::sync::Mutex;
@@ -8,6 +9,18 @@ pub struct AppInfo {
     pub bundle_id: String,
     pub name: String,
     pub pid: i32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AudioDeviceInfo {
+    pub id: u32,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct BlackHoleStatus {
+    pub installed: bool,
+    pub devices: Vec<AudioDeviceInfo>,
 }
 
 pub struct CaptureState {

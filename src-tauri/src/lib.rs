@@ -1,6 +1,6 @@
 mod audio;
 
-use audio::{AppInfo, CaptureState};
+use audio::{AppInfo, AudioDeviceInfo, BlackHoleStatus, CaptureState};
 use tauri::State;
 
 #[tauri::command]
@@ -19,6 +19,16 @@ async fn stop_capture(state: State<'_, CaptureState>) -> Result<String, String> 
     audio::capture::stop_capture(&state)
 }
 
+#[tauri::command]
+async fn list_audio_output_devices() -> Result<Vec<AudioDeviceInfo>, String> {
+    audio::devices::list_output_devices()
+}
+
+#[tauri::command]
+async fn check_blackhole() -> Result<BlackHoleStatus, String> {
+    audio::devices::check_blackhole()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
@@ -29,6 +39,8 @@ pub fn run() {
             list_audio_apps,
             start_capture,
             stop_capture,
+            list_audio_output_devices,
+            check_blackhole,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
