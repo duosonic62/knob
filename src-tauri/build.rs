@@ -16,12 +16,30 @@ fn main() {
     // TODO: remove once screencapturekit or upstream linker handles this.
     #[cfg(target_os = "macos")]
     {
+        use std::path::Path;
         use std::process::Command;
-        if let Ok(out) = Command::new("xcode-select").arg("-p").output() {
-            if out.status.success() {
-                let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let path = format!("{base}/usr/lib/swift-5.5/macosx");
+
+        // Prefer the active developer dir (xcode-select -p), but Xcode 26+ does not
+        // ship swift-5.5 back-deployment libs. Fall back to CommandLineTools, which
+        // always carries them.
+        let candidates = {
+            let mut v = Vec::new();
+            if let Ok(out) = Command::new("xcode-select").arg("-p").output() {
+                if out.status.success() {
+                    let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    v.push(format!("{base}/usr/lib/swift-5.5/macosx"));
+                }
+            }
+            v.push(
+                "/Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx".to_string(),
+            );
+            v
+        };
+
+        for path in candidates {
+            if Path::new(&path).join("libswift_Concurrency.dylib").exists() {
                 println!("cargo:rustc-link-arg=-Wl,-rpath,{path}");
+                break;
             }
         }
     }
