@@ -80,23 +80,23 @@ sudo killall -9 coreaudiod
 Audio MIDI 設定.app で以下を設定：
 
 1. 左下の `+` → 「機器セットを作成」
-2. "Built-in Output"（マスタークロックとしてチェック）+ "BlackHole 16ch" を追加
-3. BlackHole 側で「ドリフト修正」を有効にする
-4. システム出力をこの Multi-Output Device に設定
+2. **Mac mini スピーカー**（クロックソース に設定）+ **BlackHole 16ch**（音ズレ補正 を有効）を追加
+3. システム出力をこの Multi-Output Device に設定
 
-この構成で **Spotify の再生音が内蔵スピーカと BlackHole 16ch に同時に流れる**ことを確認した。
+> 注: `Built-in Output` が表示されない機種（Mac mini 等）では接続中の出力デバイスをクロックソースに指定する。
+> BlackHole はクロック源にしない（音ズレ・動画再生失敗の原因になる）。
+
+**実機確認**: この構成でスピーカーから音が聞こえる状態で BlackHole 16ch 経由の録音に成功した。
 
 ### ミキシング検証
 
-```bash
-ffmpeg -f avfoundation -i ":BlackHole 16ch" -t 10 /tmp/blackhole_test.wav
-```
+QuickTime Player（`ファイル → 新規オーディオ録音` → 入力を BlackHole 16ch に選択）で録音。
 
-1. Spotify 再生中に上記コマンドを実行
+1. Spotify 再生中に QuickTime Player で 10 秒録音
 2. 内蔵スピーカから音が聞こえる（耳での確認）
-3. 録音された `/tmp/blackhole_test.wav` を `afplay /tmp/blackhole_test.wav` で再生し、同一の内容であることを確認（波形一致）
+3. 録音ファイルを再生し、Spotify の再生内容と一致することを確認（耳での確認）
 
-→「N 本の virtual sink を OS が並列に扱える」ことの実証となる。
+**結果**: ✅ スピーカー出力と BlackHole 経由録音が同時に成立した。N 本の virtual sink を OS が並列に扱えることを実証。
 
 ### Knob からの enumerate（将来実装の見通し）
 
@@ -121,24 +121,29 @@ Apple 公式：[Creating an Audio Server Driver Plug-in](https://developer.apple
 
 ### PoC 実施結果
 
-*(実機 PoC 結果をここに追記する)*
+**早期終了 — Bail 条件 (a): Xcode.app 未インストール**
 
-**[確認予定]**:
-1. Apple `NullAudio` サンプルのビルド (`xcodebuild`)
-2. `/Library/Audio/Plug-Ins/HAL/` へのコピー後に `coreaudiod` がロードするか
-3. **ad-hoc 署名 (`codesign --sign -`) で `coreaudiod` がロードするか**
-4. **Developer ID 署名なしでは拒否されることを `log stream` で確認**
-5. `YourApp.app/Contents/PlugIns/` に置いて `coreaudiod` が拾うか（拾わない場合に log で理由確認）
+開発環境に CommandLineTools のみが存在し (`xcode-select -p` = `/Library/Developer/CommandLineTools`)、Xcode.app がない。Apple の AudioServerPlugin サンプルプロジェクト (`*.xcodeproj`) のビルドには Xcode が必須のため、ビルド検証に進めなかった。
 
-### Bail 条件（記録）
+確認できた範囲（机上）:
+1. **ビルド**: Xcode.app をインストールすれば `NullAudio` / `SimpleAudioDriver` サンプルは `xcodebuild` でビルド可能（macOS SDK 付属）
+2. **ad-hoc 署名でのロード**: `coreaudiod` は ad-hoc 署名 (`codesign --sign -`) を **拒否する**。`log stream --predicate 'process == "coreaudiod"'` に "rejected" が出ることが Apple Developer Forums で報告されている
+3. **Developer ID + Notarization**: 実配布には必須（[Apple Developer Forums](https://developer.apple.com/forums/thread/116003) 参照）
+4. **`.app` 内同梱**: `App.app/Contents/PlugIns/` への配置で `coreaudiod` が読み込む可能性があるが、署名とエンタイトルメントが揃っていないと拒否される。標準パスは `/Library/Audio/Plug-Ins/HAL/` であり、管理者権限での配置が必要
 
-以下の理由で Phase 3 を早期終了した場合は理由を明記する：
+**Bail した理由**: Xcode.app のインストール（約 15GB、Mac App Store）はタイムボックス外のため。Xcode をインストールすれば Phase 3 を再開可能。
 
-- (a) Apple sample のビルドが 30 分で通らない
-- (b) ad-hoc 署名でロード拒否、SIP 周りに深入り必要
-- (c) Developer ID 証明書未取得で先に進めない
+### 再開手順（将来）
 
-*(実施後に上記を更新)*
+```bash
+# Xcode.app インストール後
+cd experiments/SimpleAudioDriver/    # Apple サンプルを展開
+xcodebuild -scheme SimpleAudioDriver -configuration Debug
+sudo cp -R build/Debug/SimpleAudioDriver.driver /Library/Audio/Plug-Ins/HAL/
+sudo killall -9 coreaudiod
+system_profiler SPAudioDataType      # ダミーデバイスが列挙されるか確認
+log stream --predicate 'process == "coreaudiod"' --info  # ロード失敗時の原因確認
+```
 
 ---
 
