@@ -241,11 +241,10 @@ routing 層を Issue #5 / #6 で実装。
 
 | 項目 | 対応 Issue |
 |---|---|
-| Knob から CoreAudio device 列挙（BlackHole 検出）| Issue #5（新規） |
-| ScreenCaptureKit からの PCM を BlackHole の ch に書き戻す output 側実装 | Issue #6（新規） |
-| アプリ → ch ペアのルーティングテーブル UI | Issue #7（新規） |
-| AudioServerPlugin 本実装 + pkg 配布 + Notarization パイプライン | Issue #8（新規、v2 マイルストーン） |
-| BlackHole 未検出時のインストールガイド画面 | Issue #5 に含める |
+| Knob から CoreAudio device 列挙（BlackHole 検出）・未検出時のガイド画面 | 未作成 |
+| ScreenCaptureKit からの PCM を BlackHole の ch に書き戻す output 側実装 | 未作成 |
+| アプリ → ch ペアのルーティングテーブル UI | 未作成 |
+| AudioServerPlugin 本実装 + pkg 配布 + Notarization パイプライン（v2） | 未作成 |
 
 ---
 
