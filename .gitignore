@@ -8,3 +8,6 @@ node_modules
 !.env.example
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# AudioServerPlugin PoC 作業ディレクトリ（Issue #10）
+experiments/

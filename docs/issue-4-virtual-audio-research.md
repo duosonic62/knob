@@ -119,31 +119,73 @@ Apple 公式：[Creating an Audio Server Driver Plug-in](https://developer.apple
 - [BackgroundMusic](https://github.com/kyleneideck/BackgroundMusic) — 完全実装例
 - [Pancake](https://github.com/0bmxa/Pancake) — Swift ラッパー
 
-### PoC 実施結果
+### PoC 実施結果（Issue #10 で実機検証済）
 
-**早期終了 — Bail 条件 (a): Xcode.app 未インストール**
+#### 環境
 
-開発環境に CommandLineTools のみが存在し (`xcode-select -p` = `/Library/Developer/CommandLineTools`)、Xcode.app がない。Apple の AudioServerPlugin サンプルプロジェクト (`*.xcodeproj`) のビルドには Xcode が必須のため、ビルド検証に進めなかった。
+- Xcode 26.4.1 / Build 17E202 / macOS 26 / Apple Silicon (Mac mini)
+- サンプル: Apple 公式 `CreatingAnAudioServerDriverPlugIn` (NullAudio.xcodeproj)
+- SIP: **有効** (`csrutil status` = enabled)
 
-確認できた範囲（机上）:
-1. **ビルド**: Xcode.app をインストールすれば `NullAudio` / `SimpleAudioDriver` サンプルは `xcodebuild` でビルド可能（macOS SDK 付属）
-2. **ad-hoc 署名でのロード**: `coreaudiod` は ad-hoc 署名 (`codesign --sign -`) を **拒否する**。`log stream --predicate 'process == "coreaudiod"'` に "rejected" が出ることが Apple Developer Forums で報告されている
-3. **Developer ID + Notarization**: 実配布には必須（[Apple Developer Forums](https://developer.apple.com/forums/thread/116003) 参照）
-4. **`.app` 内同梱**: `App.app/Contents/PlugIns/` への配置で `coreaudiod` が読み込む可能性があるが、署名とエンタイトルメントが揃っていないと拒否される。標準パスは `/Library/Audio/Plug-Ins/HAL/` であり、管理者権限での配置が必要
-
-**Bail した理由**: Xcode.app のインストール（約 15GB、Mac App Store）はタイムボックス外のため。Xcode をインストールすれば Phase 3 を再開可能。
-
-### 再開手順（将来）
+#### 1. ビルド — ✅ 成功
 
 ```bash
-# Xcode.app インストール後
-cd experiments/SimpleAudioDriver/    # Apple サンプルを展開
-xcodebuild -scheme SimpleAudioDriver -configuration Debug
-sudo cp -R build/Debug/SimpleAudioDriver.driver /Library/Audio/Plug-Ins/HAL/
-sudo killall -9 coreaudiod
-system_profiler SPAudioDataType      # ダミーデバイスが列挙されるか確認
-log stream --predicate 'process == "coreaudiod"' --info  # ロード失敗時の原因確認
+xcodebuild -project NullAudio.xcodeproj -configuration Debug \
+  CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
+# → BUILD SUCCEEDED
 ```
+
+出力: `build/Debug/NullAudio.driver`（Mach-O universal binary: arm64 + x86_64）
+
+Xcode のリンカーが自動的に **ad-hoc 署名**（`flags=0x20002(adhoc,linker-signed)`、`TeamIdentifier=not set`）を付与。
+
+#### 2. `/Library/Audio/Plug-Ins/HAL/` へのロード — ✅ 成功（ad-hoc 署名）
+
+```bash
+sudo cp -R build/Debug/NullAudio.driver /Library/Audio/Plug-Ins/HAL/
+sudo killall -9 coreaudiod
+system_profiler SPAudioDataType
+# → "Null Audio Device: Input Channels: 2 / Output Channels: 2 / 44100Hz"
+```
+
+ad-hoc 署名のまま `coreaudiod` がロードし、OS のデバイス一覧に列挙された。
+
+#### 3. 署名要件の実機検証
+
+| 署名状態 | ロード結果 | 備考 |
+|---|---|---|
+| Xcode 自動（ad-hoc linker-signed） | **✅ ロード成功** | `Signature=adhoc`、TeamID なし |
+| 署名完全除去（`codesign --remove-signature`） | **✅ ロード成功** | SIP 有効でも coreaudiod は拒否しない |
+| Developer ID 署名 | 未検証（証明書未取得） | — |
+
+**重要な気づき**: `coreaudiod` 自体は署名を要求しない。署名（Developer ID + Notarization）が必要になるのは**配布時の Gatekeeper**（ダウンロードファイルの quarantine 属性チェック）の段階。
+
+- `sudo cp` による直接コピーは quarantine をバイパスするため、ローカルなら署名なしでも動く
+- 配布する `.pkg` インストーラ経由なら、pkg 自体を Developer ID Installer で署名 + 公証すれば内部の `.driver` に quarantine が付かず、署名なしでもロード可能（ただし Apple のガイドラインは `.driver` 自体の署名を推奨）
+
+#### 4. `.app` 内同梱 — ❌ 認識されない
+
+```bash
+mkdir -p /tmp/Knob.app/Contents/PlugIns/HAL
+cp -R NullAudio.driver /tmp/Knob.app/Contents/PlugIns/HAL/
+# /Library/Audio/Plug-Ins/HAL/ の NullAudio.driver を除去後:
+sudo killall -9 coreaudiod
+system_profiler SPAudioDataType | grep -i null  # → 出力なし
+```
+
+`coreaudiod` は `/Library/Audio/Plug-Ins/HAL/` および `~/Library/Audio/Plug-Ins/HAL/` のみを走査する。`.app/Contents/PlugIns/` は対象外であり、**`.app` 同梱で coreaudiod に直接読み込ませることは不可能**。
+
+#### 結論（v2 実現可能性の更新）
+
+| 論点 | Issue #4 時点の机上見積 | 実機検証後の結論 |
+|---|---|---|
+| ビルド難易度 | 不明 | `xcodebuild` 1 コマンドで完結 |
+| coreaudiod 署名要件 | "ad-hoc では拒否される" と想定 | **署名不要**（coreaudiod は署名チェックしない） |
+| 配布時の署名要件 | Developer ID + Notarization 必須 | **変わらず必須**（Gatekeeper が quarantine でブロック） |
+| `.app` 内同梱 | 条件付き可能と想定 | **不可能**（`coreaudiod` のスキャン対象外） |
+| pkg インストーラ | 必要と想定 | **必要**（`/Library/Audio/Plug-Ins/HAL/` への配置に管理者権限必要） |
+
+**v2 のハードルは当初想定より低い**: coreaudiod 自体はシンプルで、`.driver` のビルドも容易。Knob v2 の工数の大半は配布インフラ（Developer ID 取得・`.pkg` 作成・Notarization CI）と HAL plugin 本実装（CoreAudio HAL API、C++ / Swift）。
 
 ---
 
@@ -177,10 +219,12 @@ routing 層を Issue #5 / #6 で実装。
 ```
 
 **着手条件**:
-- Apple Developer Program 加入（年 99 USD）
-- Notarization パイプライン（CI に `xcrun notarytool` 組み込み）
+- Apple Developer Program 加入（年 99 USD）— Developer ID Installer（pkg 署名用）と Developer ID Application（driver 署名用）の両証明書が必要
+- Notarization パイプライン（CI に `xcrun notarytool submit` 組み込み）
 - C++ / Swift で HAL plugin の実装（参考: `libASPL` / `BackgroundMusic`）
-- `pkg` インストーラの整備
+- `pkg` インストーラの整備（`/Library/Audio/Plug-Ins/HAL/` への配置に管理者権限が必要なため）
+
+> **Issue #10 の実機検証で判明**: `coreaudiod` 自体は署名を要求しない。ビルドも `xcodebuild` 1 コマンドで完結。v2 の工数の大半は配布インフラ整備（pkg + Notarization CI）と HAL plugin 本実装であり、当初想定よりハードルは低い。
 
 **着手判断**: v1 のリリース後、UX フィードバック（チャンネル名・デバイス命名への不満）が蓄積したタイミングで検討。
 
