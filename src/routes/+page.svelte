@@ -1,157 +1,92 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import ChannelStrip from "$lib/components/ChannelStrip.svelte";
 
-  interface AppInfo {
-    bundle_id: string;
+  type Channel = {
+    id: string;
     name: string;
-    pid: number;
+    volume: number;
+    muted: boolean;
+  };
+
+  let channels: Channel[] = $state([
+    { id: "spotify",  name: "Spotify",       volume: 75, muted: false },
+    { id: "chrome",   name: "Google Chrome", volume: 60, muted: false },
+    { id: "discord",  name: "Discord",       volume: 80, muted: false },
+    { id: "zoom",     name: "Zoom",          volume: 50, muted: true  },
+    { id: "system",   name: "System Audio",  volume: 90, muted: false },
+  ]);
+
+  function setVolume(id: string, v: number) {
+    const ch = channels.find((c) => c.id === id);
+    if (ch) ch.volume = v;
   }
 
-  let apps: AppInfo[] = $state([]);
-  let capturing: string | null = $state(null); // bundle_id being captured
-  let savedWavPath: string | null = $state(null);
-  let errorMsg: string | null = $state(null);
-
-  async function loadApps() {
-    errorMsg = null;
-    try {
-      apps = await invoke<AppInfo[]>("list_audio_apps");
-    } catch (e) {
-      errorMsg = String(e);
-    }
-  }
-
-  async function startCapture(bundleId: string) {
-    errorMsg = null;
-    savedWavPath = null;
-    try {
-      await invoke("start_capture", { bundleId });
-      capturing = bundleId;
-      console.log("[knob] capture started:", bundleId);
-    } catch (e) {
-      errorMsg = String(e);
-    }
-  }
-
-  async function stopCapture() {
-    errorMsg = null;
-    try {
-      const path = await invoke<string>("stop_capture");
-      savedWavPath = path;
-      capturing = null;
-      console.log("[knob] capture stopped, WAV at:", path);
-    } catch (e) {
-      errorMsg = String(e);
-    }
+  function toggleMute(id: string) {
+    const ch = channels.find((c) => c.id === id);
+    if (ch) ch.muted = !ch.muted;
   }
 </script>
 
 <main>
-  <h1>Knob — ScreenCaptureKit PoC</h1>
-
-  <section class="controls">
-    <button onclick={loadApps}>アプリ一覧を取得</button>
-    {#if capturing}
-      <button class="stop" onclick={stopCapture}>停止して WAV 保存</button>
-      <span class="capturing">録音中: {capturing}</span>
-    {/if}
-  </section>
-
-  {#if errorMsg}
-    <p class="error">{errorMsg}</p>
-  {/if}
-
-  {#if savedWavPath}
-    <p class="saved">WAV 保存先: <code>{savedWavPath}</code></p>
-  {/if}
-
-  {#if apps.length > 0}
-    <table>
-      <thead>
-        <tr>
-          <th>アプリ名</th>
-          <th>Bundle ID</th>
-          <th>PID</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each apps as app}
-          <tr class={capturing === app.bundle_id ? "active" : ""}>
-            <td>{app.name}</td>
-            <td class="mono">{app.bundle_id}</td>
-            <td>{app.pid}</td>
-            <td>
-              {#if capturing === app.bundle_id}
-                <button class="stop" onclick={stopCapture}>停止</button>
-              {:else}
-                <button
-                  disabled={capturing !== null}
-                  onclick={() => startCapture(app.bundle_id)}
-                >キャプチャ</button>
-              {/if}
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-  {/if}
+  <h1>Knob Mixer</h1>
+  <div class="rack">
+    {#each channels as ch (ch.id)}
+      <ChannelStrip
+        name={ch.name}
+        volume={ch.volume}
+        muted={ch.muted}
+        onVolumeChange={(v) => setVolume(ch.id, v)}
+        onToggleMute={() => toggleMute(ch.id)}
+      />
+    {/each}
+  </div>
 </main>
 
 <style>
-  :root {
-    font-family: system-ui, sans-serif;
-    font-size: 14px;
-    color: #1a1a1a;
-    background: #f5f5f5;
-  }
+  :global {
+    :root {
+      --bg: #f5f5f5;
+      --text: #1a1a1a;
+      --text-muted: #666;
+      --strip-bg: #ffffff;
+      --strip-border: #d0d0d0;
+      --btn-bg: #ffffff;
+      --accent: #2a7fff;
+    }
 
-  @media (prefers-color-scheme: dark) {
-    :root { color: #eee; background: #1e1e1e; }
-    table { border-color: #444; }
-    th { background: #2a2a2a; }
-    tr:hover td { background: #2a2a2a; }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1e1e1e;
+        --text: #eeeeee;
+        --text-muted: #aaaaaa;
+        --strip-bg: #2a2a2a;
+        --strip-border: #444444;
+        --btn-bg: #333333;
+        --accent: #4a9bff;
+      }
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, sans-serif;
+      font-size: 14px;
+    }
   }
 
   main {
-    max-width: 900px;
-    margin: 2rem auto;
-    padding: 0 1rem;
+    padding: 1.5rem;
   }
 
-  h1 { font-size: 1.4rem; margin-bottom: 1.2rem; }
+  h1 {
+    font-size: 1.2rem;
+    margin: 0 0 1.25rem;
+  }
 
-  .controls {
+  .rack {
     display: flex;
-    align-items: center;
     gap: 0.75rem;
-    margin-bottom: 1rem;
+    align-items: flex-start;
   }
-
-  button {
-    padding: 0.4rem 0.9rem;
-    border: 1px solid #888;
-    border-radius: 4px;
-    background: #fff;
-    cursor: pointer;
-    font-size: 0.9rem;
-  }
-
-  button:hover:not(:disabled) { background: #e8e8e8; }
-  button:disabled { opacity: 0.4; cursor: default; }
-  button.stop { border-color: #c00; color: #c00; }
-  button.stop:hover { background: #fee; }
-
-  .capturing { font-size: 0.85rem; color: #c00; }
-
-  .error { color: #c00; font-size: 0.85rem; }
-  .saved { font-size: 0.85rem; }
-  code { font-family: monospace; background: #e8e8e8; padding: 0.1rem 0.3rem; border-radius: 3px; }
-
-  table { width: 100%; border-collapse: collapse; border: 1px solid #ddd; }
-  th { background: #f0f0f0; text-align: left; padding: 0.5rem 0.75rem; font-weight: 600; }
-  td { padding: 0.45rem 0.75rem; border-top: 1px solid #eee; }
-  tr:hover td { background: #fafafa; }
-  tr.active td { background: #fff5f5; }
-  .mono { font-family: monospace; font-size: 0.82rem; }
 </style>
