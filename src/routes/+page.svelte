@@ -1,156 +1,157 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
 
-  let name = $state("");
-  let greetMsg = $state("");
+  interface AppInfo {
+    bundle_id: string;
+    name: string;
+    pid: number;
+  }
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+  let apps: AppInfo[] = $state([]);
+  let capturing: string | null = $state(null); // bundle_id being captured
+  let savedWavPath: string | null = $state(null);
+  let errorMsg: string | null = $state(null);
+
+  async function loadApps() {
+    errorMsg = null;
+    try {
+      apps = await invoke<AppInfo[]>("list_audio_apps");
+    } catch (e) {
+      errorMsg = String(e);
+    }
+  }
+
+  async function startCapture(bundleId: string) {
+    errorMsg = null;
+    savedWavPath = null;
+    try {
+      await invoke("start_capture", { bundleId });
+      capturing = bundleId;
+      console.log("[knob] capture started:", bundleId);
+    } catch (e) {
+      errorMsg = String(e);
+    }
+  }
+
+  async function stopCapture() {
+    errorMsg = null;
+    try {
+      const path = await invoke<string>("stop_capture");
+      savedWavPath = path;
+      capturing = null;
+      console.log("[knob] capture stopped, WAV at:", path);
+    } catch (e) {
+      errorMsg = String(e);
+    }
   }
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<main>
+  <h1>Knob — ScreenCaptureKit PoC</h1>
 
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+  <section class="controls">
+    <button onclick={loadApps}>アプリ一覧を取得</button>
+    {#if capturing}
+      <button class="stop" onclick={stopCapture}>停止して WAV 保存</button>
+      <span class="capturing">録音中: {capturing}</span>
+    {/if}
+  </section>
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
+  {#if errorMsg}
+    <p class="error">{errorMsg}</p>
+  {/if}
+
+  {#if savedWavPath}
+    <p class="saved">WAV 保存先: <code>{savedWavPath}</code></p>
+  {/if}
+
+  {#if apps.length > 0}
+    <table>
+      <thead>
+        <tr>
+          <th>アプリ名</th>
+          <th>Bundle ID</th>
+          <th>PID</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each apps as app}
+          <tr class={capturing === app.bundle_id ? "active" : ""}>
+            <td>{app.name}</td>
+            <td class="mono">{app.bundle_id}</td>
+            <td>{app.pid}</td>
+            <td>
+              {#if capturing === app.bundle_id}
+                <button class="stop" onclick={stopCapture}>停止</button>
+              {:else}
+                <button
+                  disabled={capturing !== null}
+                  onclick={() => startCapture(app.bundle_id)}
+                >キャプチャ</button>
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  {/if}
 </main>
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
   :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+    font-family: system-ui, sans-serif;
+    font-size: 14px;
+    color: #1a1a1a;
+    background: #f5f5f5;
   }
 
-  a:hover {
-    color: #24c8db;
+  @media (prefers-color-scheme: dark) {
+    :root { color: #eee; background: #1e1e1e; }
+    table { border-color: #444; }
+    th { background: #2a2a2a; }
+    tr:hover td { background: #2a2a2a; }
   }
 
-  input,
+  main {
+    max-width: 900px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+  }
+
+  h1 { font-size: 1.4rem; margin-bottom: 1.2rem; }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+  }
+
   button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
+    padding: 0.4rem 0.9rem;
+    border: 1px solid #888;
+    border-radius: 4px;
+    background: #fff;
+    cursor: pointer;
+    font-size: 0.9rem;
   }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
 
+  button:hover:not(:disabled) { background: #e8e8e8; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.stop { border-color: #c00; color: #c00; }
+  button.stop:hover { background: #fee; }
+
+  .capturing { font-size: 0.85rem; color: #c00; }
+
+  .error { color: #c00; font-size: 0.85rem; }
+  .saved { font-size: 0.85rem; }
+  code { font-family: monospace; background: #e8e8e8; padding: 0.1rem 0.3rem; border-radius: 3px; }
+
+  table { width: 100%; border-collapse: collapse; border: 1px solid #ddd; }
+  th { background: #f0f0f0; text-align: left; padding: 0.5rem 0.75rem; font-weight: 600; }
+  td { padding: 0.45rem 0.75rem; border-top: 1px solid #eee; }
+  tr:hover td { background: #fafafa; }
+  tr.active td { background: #fff5f5; }
+  .mono { font-family: monospace; font-size: 0.82rem; }
 </style>
