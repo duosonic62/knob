@@ -238,6 +238,8 @@ fn build_stream_route(
     let bid_for_stop = bundle_id.to_string();
     let app_for_err = app.clone();
     let bid_for_err = bundle_id.to_string();
+    let app_for_inactive = app.clone();
+    let bid_for_inactive = bundle_id.to_string();
     let delegate = StreamCallbacks::new()
         .on_stop(move |err| {
             log::info!("[knob] SCK stream_did_stop bundle={} err={:?}", bid_for_stop, err);
@@ -246,6 +248,11 @@ fn build_stream_route(
         .on_error(move |err| {
             log::warn!("[knob] SCK did_stop_with_error bundle={} err={}", bid_for_err, err);
             handle_sck_termination(app_for_err.clone(), bid_for_err.clone());
+        })
+        .on_inactive(move || {
+            // Fires when all shared windows are gone (target app quit)
+            log::info!("[knob] SCK stream became inactive bundle={}", bid_for_inactive);
+            handle_sck_termination(app_for_inactive.clone(), bid_for_inactive.clone());
         });
 
     let g_arc = gain_bits;
