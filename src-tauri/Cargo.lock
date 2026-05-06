@@ -2049,6 +2049,7 @@ dependencies = [
  "coreaudio-sys",
  "env_logger",
  "hound",
+ "libc",
  "log",
  "parking_lot",
  "ringbuf",
