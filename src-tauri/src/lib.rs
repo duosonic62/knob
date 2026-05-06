@@ -1,7 +1,9 @@
 mod audio;
+mod settings;
 
 use audio::{AppInfo, AudioDeviceInfo, BlackHoleStatus, CaptureState, RoutingState};
-use tauri::State;
+use settings::{Settings, SettingsState};
+use tauri::{Manager, State};
 
 #[tauri::command]
 async fn list_audio_apps(state: State<'_, CaptureState>) -> Result<Vec<AppInfo>, String> {
@@ -49,27 +51,35 @@ async fn stop_routing(
 }
 
 #[tauri::command]
-async fn set_routing_volume(volume: f32, rt: State<'_, RoutingState>) -> Result<(), String> {
-    let handle = rt.handle.lock();
-    match &*handle {
-        Some(h) => {
-            audio::router::set_gain(h, volume);
-            Ok(())
-        }
-        None => Err("No routing active".to_string()),
-    }
+async fn get_settings(s: State<'_, SettingsState>) -> Result<Settings, String> {
+    Ok(s.inner.lock().clone())
 }
 
 #[tauri::command]
-async fn set_routing_mute(muted: bool, rt: State<'_, RoutingState>) -> Result<(), String> {
-    let handle = rt.handle.lock();
-    match &*handle {
-        Some(h) => {
+async fn set_app_settings(
+    bundle_id: String,
+    volume: f32,
+    muted: bool,
+    s: State<'_, SettingsState>,
+    rt: State<'_, RoutingState>,
+) -> Result<(), String> {
+    let volume = volume.clamp(0.0, 1.0);
+
+    let snapshot = {
+        let mut g = s.inner.lock();
+        g.apps.insert(bundle_id.clone(), settings::AppSettings { volume, muted });
+        g.clone()
+    };
+    settings::save(&snapshot, &s.path)?;
+
+    let active = rt.active.lock();
+    if let Some((rb, h)) = active.as_ref() {
+        if rb == &bundle_id {
+            audio::router::set_gain(h, volume);
             audio::router::set_muted(h, muted);
-            Ok(())
         }
-        None => Err("No routing active".to_string()),
     }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -79,6 +89,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(CaptureState::default())
         .manage(RoutingState::default())
+        .setup(|app| {
+            let dir = app
+                .path()
+                .app_config_dir()
+                .map_err(|e| format!("app_config_dir failed: {}", e))?;
+            let path = dir.join("settings.json");
+            let loaded = settings::load(&path);
+            app.manage(SettingsState {
+                inner: parking_lot::Mutex::new(loaded),
+                path,
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_audio_apps,
             start_capture,
@@ -87,8 +110,8 @@ pub fn run() {
             check_blackhole,
             start_routing,
             stop_routing,
-            set_routing_volume,
-            set_routing_mute,
+            get_settings,
+            set_app_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

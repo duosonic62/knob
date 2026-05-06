@@ -37,13 +37,13 @@ impl Default for CaptureState {
 }
 
 pub struct RoutingState {
-    pub handle: parking_lot::Mutex<Option<router::RouterHandle>>,
+    pub active: parking_lot::Mutex<Option<(String, router::RouterHandle)>>,
 }
 
 impl Default for RoutingState {
     fn default() -> Self {
         Self {
-            handle: parking_lot::Mutex::new(None),
+            active: parking_lot::Mutex::new(None),
         }
     }
 }

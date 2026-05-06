@@ -14,11 +14,7 @@ pub enum CaptureSink {
         path: String,
         writer: Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
     },
-    Route {
-        gain_bits: Arc<AtomicU32>,
-        muted: Arc<AtomicBool>,
-        overrun_count: Arc<AtomicU64>,
-    },
+    Route,
 }
 
 pub struct CaptureSession {
@@ -270,8 +266,8 @@ pub fn start_routing(
     if session.is_some() {
         return Err("Capture already running. Stop it first.".to_string());
     }
-    let mut handle_lock = rt.handle.lock();
-    if handle_lock.is_some() {
+    let mut active_lock = rt.active.lock();
+    if active_lock.is_some() {
         return Err("Routing already active. Stop it first.".to_string());
     }
 
@@ -283,7 +279,7 @@ pub fn start_routing(
     let device_id = bh.devices[0].id;
 
     // Open HAL IOProc route
-    let (mut handle, producer) = router::open_blackhole_route(device_id)?;
+    let (handle, producer) = router::open_blackhole_route(device_id)?;
 
     // Apply initial volume/mute before SCK starts (prevents audio jump race)
     router::set_gain(&handle, initial_volume);
@@ -319,13 +315,9 @@ pub fn start_routing(
 
     *session = Some(CaptureSession {
         stream,
-        sink: CaptureSink::Route {
-            gain_bits,
-            muted,
-            overrun_count,
-        },
+        sink: CaptureSink::Route,
     });
-    *handle_lock = Some(handle);
+    *active_lock = Some((bundle_id.to_string(), handle));
     Ok(())
 }
 
@@ -339,8 +331,7 @@ pub fn stop_routing(
     // Stop SCK first so producer stops pushing before IOProc consumer is torn down
     sess.stream.stop_capture().map_err(|e| e.to_string())?;
 
-    let mut handle_lock = rt.handle.lock();
-    if let Some(handle) = handle_lock.take() {
+    if let Some((_, handle)) = rt.active.lock().take() {
         router::close_route(handle)?;
     }
 
