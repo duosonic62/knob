@@ -33,13 +33,14 @@ async fn check_blackhole() -> Result<BlackHoleStatus, String> {
 
 #[tauri::command]
 async fn start_routing(
+    app: tauri::AppHandle,
     bundle_id: String,
     volume: f32,
     muted: bool,
     cap: State<'_, CaptureState>,
     rt: State<'_, RoutingState>,
 ) -> Result<(), String> {
-    audio::capture::start_routing(&bundle_id, volume, muted, &cap, &rt)
+    audio::capture::start_routing(&bundle_id, volume, muted, &cap, &rt, app)
 }
 
 #[tauri::command]

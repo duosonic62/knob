@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
 use screencapturekit::prelude::*;
+use screencapturekit::stream::delegate_trait::StreamCallbacks;
+use tauri::{AppHandle, Emitter, Manager};
 
 use super::AppInfo;
 use super::router::{self, SampleProducer};
@@ -183,14 +185,68 @@ pub fn stop_capture(state: &super::CaptureState) -> Result<String, String> {
     Ok(path)
 }
 
+fn handle_sck_termination(app: AppHandle, bundle_id: String) {
+    tauri::async_runtime::spawn(async move {
+        let cap = app.state::<super::CaptureState>();
+        let rt = app.state::<super::RoutingState>();
+
+        // Lock order must match stop_routing: cap.session → rt.active (deadlock prevention)
+        let mut session_lock = match cap.session.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let mut active_lock = rt.active.lock();
+
+        // Take only if this bundle is still the active route (race-free under both locks)
+        let bundle_match = matches!(
+            active_lock.as_ref(),
+            Some((bid, _)) if bid == &bundle_id
+        );
+        if !bundle_match {
+            return;
+        }
+        let _session_dropped = session_lock.take(); // SCStream drop; SCK already stopped
+        let handle = active_lock.take().map(|(_, h)| h);
+
+        // Release locks before CoreAudio calls (AudioDeviceStop can block)
+        drop(active_lock);
+        drop(session_lock);
+
+        if let Some(h) = handle {
+            if let Err(e) = router::close_route(h) {
+                log::warn!("[knob] close_route after SCK termination failed: {}", e);
+            }
+        }
+        if let Err(e) = app.emit("routing-stopped", &bundle_id) {
+            log::warn!("[knob] emit routing-stopped failed: {}", e);
+        }
+        log::info!("[knob] routing auto-stopped for '{}'", bundle_id);
+    });
+}
+
 fn build_stream_route(
     bundle_id: &str,
     producer: SampleProducer,
     gain_bits: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
     overrun_count: Arc<AtomicU64>,
+    app: AppHandle,
 ) -> Result<SCStream, String> {
     let (filter, config) = build_filter_and_config(bundle_id)?;
+
+    let app_for_stop = app.clone();
+    let bid_for_stop = bundle_id.to_string();
+    let app_for_err = app.clone();
+    let bid_for_err = bundle_id.to_string();
+    let delegate = StreamCallbacks::new()
+        .on_stop(move |err| {
+            log::info!("[knob] SCK stream_did_stop bundle={} err={:?}", bid_for_stop, err);
+            handle_sck_termination(app_for_stop.clone(), bid_for_stop.clone());
+        })
+        .on_error(move |err| {
+            log::warn!("[knob] SCK did_stop_with_error bundle={} err={}", bid_for_err, err);
+            handle_sck_termination(app_for_err.clone(), bid_for_err.clone());
+        });
 
     let g_arc = gain_bits;
     let m_arc = muted;
@@ -199,7 +255,7 @@ fn build_stream_route(
     // SCK calls from a single dispatch queue so this is always uncontended.
     let producer = parking_lot::Mutex::new(producer);
 
-    let mut stream = SCStream::new(&filter, &config);
+    let mut stream = SCStream::new_with_delegate(&filter, &config, delegate);
     stream.add_output_handler(
         move |sample: CMSampleBuffer, of_type: SCStreamOutputType| {
             if of_type != SCStreamOutputType::Audio {
@@ -261,6 +317,7 @@ pub fn start_routing(
     initial_muted: bool,
     cap: &super::CaptureState,
     rt: &super::RoutingState,
+    app: AppHandle,
 ) -> Result<(), String> {
     let mut session = cap.session.lock().unwrap();
     if session.is_some() {
@@ -295,6 +352,7 @@ pub fn start_routing(
         gain_bits.clone(),
         muted.clone(),
         overrun_count.clone(),
+        app,
     ) {
         Ok(s) => s,
         Err(e) => {

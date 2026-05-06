@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import ChannelStrip from "$lib/components/ChannelStrip.svelte";
   import BlackHoleGuide from "$lib/components/BlackHoleGuide.svelte";
 
@@ -23,7 +24,22 @@
       gate = { kind: "error", message: String(e) };
     }
   }
-  onMount(recheck);
+  let unlistenStopped: UnlistenFn | null = null;
+
+  onMount(async () => {
+    await recheck();
+    unlistenStopped = await listen<string>("routing-stopped", ({ payload }) => {
+      if (routedBundleId === payload) {
+        routedBundleId = null;
+      }
+      const name = apps.find((a) => a.bundle_id === payload)?.name ?? payload;
+      routeError = `${name} が終了したためルーティングを停止しました`;
+    });
+  });
+
+  onDestroy(() => {
+    unlistenStopped?.();
+  });
 
   type AppInfo = { bundle_id: string; name: string; pid: number };
   type Strip = AppInfo & { volume: number; muted: boolean };
