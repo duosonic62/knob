@@ -8,6 +8,9 @@ use screencapturekit::prelude::*;
 use screencapturekit::stream::delegate_trait::StreamCallbacks;
 use tauri::{AppHandle, Emitter, Manager};
 
+#[cfg(target_os = "macos")]
+extern crate libc;
+
 use super::AppInfo;
 use super::router::{self, SampleProducer};
 
@@ -185,6 +188,35 @@ pub fn stop_capture(state: &super::CaptureState) -> Result<String, String> {
     Ok(path)
 }
 
+fn start_exit_watch(app: AppHandle, bundle_id: String, pid: i32) {
+    std::thread::Builder::new()
+        .name(format!("exit-watch-{}", bundle_id))
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                // Bail if this bundle is no longer the active route
+                {
+                    let rt = app.state::<super::RoutingState>();
+                    let active = rt.active.lock();
+                    match active.as_ref() {
+                        Some((bid, _)) if bid == &bundle_id => {}
+                        _ => break,
+                    }
+                }
+
+                // kill(pid, 0) returns 0 if process exists, -1 (ESRCH) if not
+                let process_exists = unsafe { libc::kill(pid, 0) == 0 };
+                if !process_exists {
+                    log::info!("[knob] process exit detected: bundle={} pid={}", bundle_id, pid);
+                    handle_sck_termination(app.clone(), bundle_id.clone());
+                    break;
+                }
+            }
+        })
+        .ok();
+}
+
 fn handle_sck_termination(app: AppHandle, bundle_id: String) {
     tauri::async_runtime::spawn(async move {
         let cap = app.state::<super::CaptureState>();
@@ -231,6 +263,7 @@ fn build_stream_route(
     muted: Arc<AtomicBool>,
     overrun_count: Arc<AtomicU64>,
     app: AppHandle,
+    pid: i32,
 ) -> Result<SCStream, String> {
     let (filter, config) = build_filter_and_config(bundle_id)?;
 
@@ -261,6 +294,8 @@ fn build_stream_route(
     // SCK requires Fn (not FnMut); wrap producer in Mutex for interior mutability.
     // SCK calls from a single dispatch queue so this is always uncontended.
     let producer = parking_lot::Mutex::new(producer);
+
+    start_exit_watch(app.clone(), bundle_id.to_string(), pid);
 
     let mut stream = SCStream::new_with_delegate(&filter, &config, delegate);
     stream.add_output_handler(
@@ -335,6 +370,17 @@ pub fn start_routing(
         return Err("Routing already active. Stop it first.".to_string());
     }
 
+    // Get target app PID for process exit monitoring
+    let pid = {
+        let content = SCShareableContent::get().map_err(|e| e.to_string())?;
+        content
+            .applications()
+            .into_iter()
+            .find(|a| a.bundle_identifier() == bundle_id)
+            .map(|a| a.process_id())
+            .ok_or_else(|| format!("App '{}' not found", bundle_id))?
+    };
+
     // Get BlackHole device id
     let bh = super::devices::check_blackhole()?;
     if !bh.installed {
@@ -360,6 +406,7 @@ pub fn start_routing(
         muted.clone(),
         overrun_count.clone(),
         app,
+        pid,
     ) {
         Ok(s) => s,
         Err(e) => {

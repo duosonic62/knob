@@ -32,4 +32,5 @@ screencapturekit = "1.5.4"
 coreaudio-sys = "0.2"
 core-foundation = "0.10"
 ringbuf = "0.4"
+libc = "0.2"
 
