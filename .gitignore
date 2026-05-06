@@ -11,3 +11,6 @@ vite.config.ts.timestamp-*
 
 # AudioServerPlugin PoC 作業ディレクトリ（Issue #10）
 experiments/
+
+# 作業計画メモ
+plans/
