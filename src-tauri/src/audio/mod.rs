@@ -1,5 +1,6 @@
 pub mod capture;
 pub mod devices;
+pub mod resampler;
 pub mod router;
 
 use serde::Serialize;
