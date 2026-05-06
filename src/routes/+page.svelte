@@ -27,18 +27,37 @@
 
   type AppInfo = { bundle_id: string; name: string; pid: number };
   type Strip = AppInfo & { volume: number; muted: boolean };
+  type AppSettings = { volume: number; muted: boolean };
+  type SettingsBlob = { version: number; apps: Record<string, AppSettings> };
 
   let apps = $state<Strip[]>([]);
   let routedBundleId = $state<string | null>(null);
   let busy = $state(false);
   let routeError = $state<string | null>(null);
 
+  let savedSettings = $state<Record<string, AppSettings>>({});
+  let settingsLoaded = false;
+
+  async function loadSettings() {
+    const blob = await invoke<SettingsBlob>("get_settings");
+    savedSettings = blob.apps ?? {};
+    settingsLoaded = true;
+  }
+
   async function refreshApps() {
     try {
+      if (!settingsLoaded) await loadSettings();
       const list = await invoke<AppInfo[]>("list_audio_apps");
       apps = list
         .filter((a) => a.bundle_id && !a.bundle_id.startsWith("com.apple."))
-        .map((a) => ({ ...a, volume: 75, muted: false }));
+        .map((a) => {
+          const saved = savedSettings[a.bundle_id];
+          return {
+            ...a,
+            volume: saved ? Math.round(saved.volume * 100) : 75,
+            muted: saved?.muted ?? false,
+          };
+        });
     } catch (e) {
       routeError = String(e);
     }
@@ -78,27 +97,28 @@
     }
   }
 
+  async function persist(bundleId: string, volume: number, muted: boolean) {
+    await invoke("set_app_settings", { bundleId, volume: volume / 100, muted });
+    savedSettings[bundleId] = { volume: volume / 100, muted };
+  }
+
   async function onVolume(bundleId: string, v: number) {
     const s = apps.find((a) => a.bundle_id === bundleId)!;
     s.volume = v;
-    if (routedBundleId === bundleId) {
-      try {
-        await invoke("set_routing_volume", { volume: v / 100 });
-      } catch (e) {
-        routeError = String(e);
-      }
+    try {
+      await persist(bundleId, v, s.muted);
+    } catch (e) {
+      routeError = String(e);
     }
   }
 
   async function onMute(bundleId: string) {
     const s = apps.find((a) => a.bundle_id === bundleId)!;
     s.muted = !s.muted;
-    if (routedBundleId === bundleId) {
-      try {
-        await invoke("set_routing_mute", { muted: s.muted });
-      } catch (e) {
-        routeError = String(e);
-      }
+    try {
+      await persist(bundleId, s.volume, s.muted);
+    } catch (e) {
+      routeError = String(e);
     }
   }
 

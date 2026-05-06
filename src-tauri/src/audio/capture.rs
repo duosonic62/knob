@@ -270,8 +270,8 @@ pub fn start_routing(
     if session.is_some() {
         return Err("Capture already running. Stop it first.".to_string());
     }
-    let mut handle_lock = rt.handle.lock();
-    if handle_lock.is_some() {
+    let mut active_lock = rt.active.lock();
+    if active_lock.is_some() {
         return Err("Routing already active. Stop it first.".to_string());
     }
 
@@ -325,7 +325,7 @@ pub fn start_routing(
             overrun_count,
         },
     });
-    *handle_lock = Some(handle);
+    *active_lock = Some((bundle_id.to_string(), handle));
     Ok(())
 }
 
@@ -339,8 +339,7 @@ pub fn stop_routing(
     // Stop SCK first so producer stops pushing before IOProc consumer is torn down
     sess.stream.stop_capture().map_err(|e| e.to_string())?;
 
-    let mut handle_lock = rt.handle.lock();
-    if let Some(handle) = handle_lock.take() {
+    if let Some((_, handle)) = rt.active.lock().take() {
         router::close_route(handle)?;
     }
 
