@@ -1,5 +1,6 @@
 pub mod capture;
 pub mod devices;
+pub mod router;
 
 use serde::Serialize;
 use std::sync::Mutex;
@@ -31,6 +32,18 @@ impl Default for CaptureState {
     fn default() -> Self {
         Self {
             session: Mutex::new(None),
+        }
+    }
+}
+
+pub struct RoutingState {
+    pub handle: parking_lot::Mutex<Option<router::RouterHandle>>,
+}
+
+impl Default for RoutingState {
+    fn default() -> Self {
+        Self {
+            handle: parking_lot::Mutex::new(None),
         }
     }
 }

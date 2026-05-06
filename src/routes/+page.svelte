@@ -25,30 +25,86 @@
   }
   onMount(recheck);
 
-  type Channel = {
-    id: string;
-    name: string;
-    volume: number;
-    muted: boolean;
-  };
+  type AppInfo = { bundle_id: string; name: string; pid: number };
+  type Strip = AppInfo & { volume: number; muted: boolean };
 
-  let channels: Channel[] = $state([
-    { id: "spotify",  name: "Spotify",       volume: 75, muted: false },
-    { id: "chrome",   name: "Google Chrome", volume: 60, muted: false },
-    { id: "discord",  name: "Discord",       volume: 80, muted: false },
-    { id: "zoom",     name: "Zoom",          volume: 50, muted: true  },
-    { id: "system",   name: "System Audio",  volume: 90, muted: false },
-  ]);
+  let apps = $state<Strip[]>([]);
+  let routedBundleId = $state<string | null>(null);
+  let busy = $state(false);
+  let routeError = $state<string | null>(null);
 
-  function setVolume(id: string, v: number) {
-    const ch = channels.find((c) => c.id === id);
-    if (ch) ch.volume = v;
+  async function refreshApps() {
+    try {
+      const list = await invoke<AppInfo[]>("list_audio_apps");
+      apps = list
+        .filter((a) => a.bundle_id && !a.bundle_id.startsWith("com.apple."))
+        .map((a) => ({ ...a, volume: 75, muted: false }));
+    } catch (e) {
+      routeError = String(e);
+    }
   }
 
-  function toggleMute(id: string) {
-    const ch = channels.find((c) => c.id === id);
-    if (ch) ch.muted = !ch.muted;
+  async function onRoute(bundleId: string) {
+    busy = true;
+    routeError = null;
+    try {
+      if (routedBundleId) {
+        await invoke("stop_routing");
+        routedBundleId = null;
+      }
+      const s = apps.find((a) => a.bundle_id === bundleId)!;
+      await invoke("start_routing", {
+        bundleId,
+        volume: s.volume / 100,
+        muted: s.muted,
+      });
+      routedBundleId = bundleId;
+    } catch (e) {
+      routeError = String(e);
+    } finally {
+      busy = false;
+    }
   }
+
+  async function onStop() {
+    busy = true;
+    try {
+      await invoke("stop_routing");
+      routedBundleId = null;
+    } catch (e) {
+      routeError = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function onVolume(bundleId: string, v: number) {
+    const s = apps.find((a) => a.bundle_id === bundleId)!;
+    s.volume = v;
+    if (routedBundleId === bundleId) {
+      try {
+        await invoke("set_routing_volume", { volume: v / 100 });
+      } catch (e) {
+        routeError = String(e);
+      }
+    }
+  }
+
+  async function onMute(bundleId: string) {
+    const s = apps.find((a) => a.bundle_id === bundleId)!;
+    s.muted = !s.muted;
+    if (routedBundleId === bundleId) {
+      try {
+        await invoke("set_routing_mute", { muted: s.muted });
+      } catch (e) {
+        routeError = String(e);
+      }
+    }
+  }
+
+  $effect(() => {
+    if (gate.kind === "ok" && apps.length === 0) refreshApps();
+  });
 </script>
 
 {#if gate.kind === "checking"}
@@ -65,17 +121,36 @@
   <BlackHoleGuide onRecheck={recheck} />
 {:else}
   <main>
-    <h1>Knob Mixer</h1>
+    <div class="toolbar">
+      <h1>Knob Mixer</h1>
+      <button class="refresh" onclick={refreshApps} disabled={busy}>アプリ一覧を更新</button>
+    </div>
+
+    {#if routeError}
+      <div class="error-toast">
+        <span>{routeError}</span>
+        <button onclick={() => (routeError = null)}>×</button>
+      </div>
+    {/if}
+
     <div class="rack">
-      {#each channels as ch (ch.id)}
+      {#each apps as app (app.bundle_id)}
         <ChannelStrip
-          name={ch.name}
-          volume={ch.volume}
-          muted={ch.muted}
-          onVolumeChange={(v) => setVolume(ch.id, v)}
-          onToggleMute={() => toggleMute(ch.id)}
+          name={app.name}
+          volume={app.volume}
+          muted={app.muted}
+          routing={routedBundleId === app.bundle_id}
+          disabled={busy}
+          onVolumeChange={(v) => onVolume(app.bundle_id, v)}
+          onToggleMute={() => onMute(app.bundle_id)}
+          onRoute={() => onRoute(app.bundle_id)}
+          onStop={onStop}
         />
       {/each}
+
+      {#if apps.length === 0}
+        <p class="empty">アプリが見つかりません。「アプリ一覧を更新」を押してください。</p>
+      {/if}
     </div>
   </main>
 {/if}
@@ -117,15 +192,77 @@
     padding: 1.5rem;
   }
 
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.25rem;
+  }
+
   h1 {
     font-size: 1.2rem;
-    margin: 0 0 1.25rem;
+    margin: 0;
+  }
+
+  .refresh {
+    padding: 0.3rem 0.8rem;
+    font-size: 0.82rem;
+    border: 1px solid var(--strip-border);
+    border-radius: 4px;
+    background: var(--btn-bg);
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .refresh:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .refresh:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
   .rack {
     display: flex;
     gap: 0.75rem;
     align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .empty {
+    color: var(--text-muted);
+    font-size: 0.88rem;
+    margin: 0;
+  }
+
+  .error-toast {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    background: #fef2f2;
+    border: 1px solid #fca5a5;
+    border-radius: 6px;
+    padding: 0.6rem 0.9rem;
+    margin-bottom: 1rem;
+    font-size: 0.85rem;
+    color: #b91c1c;
+
+    span {
+      flex: 1;
+      word-break: break-word;
+    }
+
+    button {
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 1rem;
+      color: #b91c1c;
+      padding: 0;
+      line-height: 1;
+    }
   }
 
   .checking {
