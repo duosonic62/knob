@@ -25,6 +25,7 @@
     }
   }
   let unlistenStopped: UnlistenFn | null = null;
+  let unlistenLevel: UnlistenFn | null = null;
 
   onMount(async () => {
     await recheck();
@@ -32,17 +33,26 @@
       if (routedBundleId === payload) {
         routedBundleId = null;
       }
-      const name = apps.find((a) => a.bundle_id === payload)?.name ?? payload;
+      const stopped = apps.find((a) => a.bundle_id === payload);
+      if (stopped) stopped.level = 0;
+      const name = stopped?.name ?? payload;
       routeInfo = `${name} が終了したためルーティングを停止しました`;
+    });
+    unlistenLevel = await listen<AudioLevelEvent>("audio-level", ({ payload }) => {
+      const s = apps.find((a) => a.bundle_id === payload.bundle_id);
+      if (s) s.level = payload.rms;
     });
   });
 
   onDestroy(() => {
     unlistenStopped?.();
+    unlistenLevel?.();
   });
 
+  type AudioLevelEvent = { bundle_id: string; rms: number };
+
   type AppInfo = { bundle_id: string; name: string; pid: number };
-  type Strip = AppInfo & { volume: number; muted: boolean };
+  type Strip = AppInfo & { volume: number; muted: boolean; level: number };
   type AppSettings = { volume: number; muted: boolean };
   type SettingsBlob = { version: number; apps: Record<string, AppSettings> };
 
@@ -73,6 +83,7 @@
             ...a,
             volume: saved ? Math.round(saved.volume * 100) : 75,
             muted: saved?.muted ?? false,
+            level: 0,
           };
         });
     } catch (e) {
@@ -106,6 +117,8 @@
     busy = true;
     try {
       await invoke("stop_routing");
+      const s = apps.find((a) => a.bundle_id === routedBundleId);
+      if (s) s.level = 0;
       routedBundleId = null;
     } catch (e) {
       routeError = String(e);
@@ -185,6 +198,8 @@
           muted={app.muted}
           routing={routedBundleId === app.bundle_id}
           disabled={busy}
+          level={app.level}
+          showMeter={routedBundleId === app.bundle_id}
           onVolumeChange={(v) => onVolume(app.bundle_id, v)}
           onToggleMute={() => onMute(app.bundle_id)}
           onRoute={() => onRoute(app.bundle_id)}

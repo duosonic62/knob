@@ -291,6 +291,9 @@ fn build_stream_route(
     let g_arc = gain_bits;
     let m_arc = muted;
     let oc = overrun_count;
+    let app_for_meter = app.clone();
+    let bid_for_meter = bundle_id.to_string();
+    let meter_count = AtomicU64::new(0);
     // SCK requires Fn (not FnMut); wrap producer in Mutex for interior mutability.
     // SCK calls from a single dispatch queue so this is always uncontended.
     let producer = parking_lot::Mutex::new(producer);
@@ -344,6 +347,23 @@ fn build_stream_route(
                         "[knob] ring overrun: dropped {} samples",
                         scratch.len() - pushed
                     );
+                }
+            }
+
+            let mc = meter_count.fetch_add(1, Ordering::Relaxed);
+            if mc % 10 == 0 {
+                let sum_sq: f64 = scratch.iter().map(|&s| (s as f64).powi(2)).sum();
+                let rms = if scratch.is_empty() {
+                    0.0
+                } else {
+                    (sum_sq / scratch.len() as f64).sqrt() as f32
+                };
+                let payload = super::AudioLevel {
+                    bundle_id: bid_for_meter.clone(),
+                    rms,
+                };
+                if let Err(e) = app_for_meter.emit("audio-level", &payload) {
+                    log::warn!("[knob] emit audio-level failed: {}", e);
                 }
             }
         },
