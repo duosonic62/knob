@@ -33,7 +33,7 @@
         routedBundleId = null;
       }
       const name = apps.find((a) => a.bundle_id === payload)?.name ?? payload;
-      routeError = `${name} が終了したためルーティングを停止しました`;
+      routeInfo = `${name} が終了したためルーティングを停止しました`;
     });
   });
 
@@ -50,6 +50,7 @@
   let routedBundleId = $state<string | null>(null);
   let busy = $state(false);
   let routeError = $state<string | null>(null);
+  let routeInfo = $state<string | null>(null);
 
   let savedSettings = $state<Record<string, AppSettings>>({});
   let settingsLoaded = false;
@@ -166,6 +167,13 @@
       <div class="error-toast">
         <span>{routeError}</span>
         <button onclick={() => (routeError = null)}>×</button>
+      </div>
+    {/if}
+
+    {#if routeInfo}
+      <div class="info-toast">
+        <span>{routeInfo}</span>
+        <button onclick={() => (routeInfo = null)}>×</button>
       </div>
     {/if}
 
@@ -296,6 +304,34 @@
       cursor: pointer;
       font-size: 1rem;
       color: #b91c1c;
+      padding: 0;
+      line-height: 1;
+    }
+  }
+
+  .info-toast {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    background: #eff6ff;
+    border: 1px solid #93c5fd;
+    border-radius: 6px;
+    padding: 0.6rem 0.9rem;
+    margin-bottom: 1rem;
+    font-size: 0.85rem;
+    color: #1e40af;
+
+    span {
+      flex: 1;
+      word-break: break-word;
+    }
+
+    button {
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 1rem;
+      color: #1e40af;
       padding: 0;
       line-height: 1;
     }
