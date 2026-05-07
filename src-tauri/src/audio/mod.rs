@@ -25,6 +25,12 @@ pub struct BlackHoleStatus {
     pub devices: Vec<AudioDeviceInfo>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct AudioLevel {
+    pub bundle_id: String,
+    pub rms: f32,
+}
+
 pub struct CaptureState {
     pub session: Mutex<Option<capture::CaptureSession>>,
 }
