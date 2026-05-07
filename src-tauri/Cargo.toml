@@ -33,4 +33,5 @@ coreaudio-sys = "0.2"
 core-foundation = "0.10"
 ringbuf = "0.4"
 libc = "0.2"
+rubato = "0.15"
 

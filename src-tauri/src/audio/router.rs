@@ -26,6 +26,8 @@ use coreaudio_sys::{
 use ringbuf::traits::Split;
 use ringbuf::{HeapProd, HeapRb};
 
+use super::resampler::StereoResampler;
+
 const ELEMENT_MAIN: u32 = 0;
 
 pub type SampleProducer = HeapProd<f32>;
@@ -34,6 +36,7 @@ struct IoProcCtx {
     consumer: ringbuf::HeapCons<f32>,
     interleaved: bool,
     scratch: Vec<f32>,
+    resampler: Option<StereoResampler>,
 }
 
 pub struct RouterHandle {
@@ -49,7 +52,7 @@ unsafe impl Sync for RouterHandle {}
 
 pub fn open_blackhole_route(device_id: AudioDeviceID) -> Result<(RouterHandle, SampleProducer), String> {
     unsafe {
-        // 1. 48kHz check
+        // 1. Query BlackHole sample rate; build resampler if not 48 kHz
         let rate_addr = coreaudio_sys::AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyNominalSampleRate,
             mScope: kAudioObjectPropertyScopeOutput,
@@ -68,13 +71,22 @@ pub fn open_blackhole_route(device_id: AudioDeviceID) -> Result<(RouterHandle, S
         if status != 0 {
             return Err(format!("CoreAudio error reading sample rate: {}", status));
         }
-        if (rate - 48000.0).abs() > 0.5 {
-            return Err(format!(
-                "BlackHole 16ch のサンプルレートが 48 kHz ではありません (現在: {} Hz)。\
-                Audio MIDI Setup → BlackHole 16ch → フォーマットを 48000 Hz に変更してください。",
-                rate as u32
-            ));
-        }
+        const SCK_INPUT_RATE: f64 = 48000.0;
+        const RESAMPLER_OUTPUT_CHUNK: usize = 1024;
+
+        let resampler = if (rate - SCK_INPUT_RATE).abs() > 0.5 {
+            log::info!(
+                "[knob] router: {} Hz → {} Hz, resampler=enabled",
+                SCK_INPUT_RATE as u32, rate as u32
+            );
+            Some(
+                StereoResampler::new(SCK_INPUT_RATE, rate, RESAMPLER_OUTPUT_CHUNK)
+                    .map_err(|e| format!("resampler init failed: {}", e))?,
+            )
+        } else {
+            log::info!("[knob] router: 48000 Hz, resampler=passthrough");
+            None
+        };
 
         // 2. Get ASBD to determine interleaved vs non-interleaved
         let streams_addr = coreaudio_sys::AudioObjectPropertyAddress {
@@ -137,6 +149,7 @@ pub fn open_blackhole_route(device_id: AudioDeviceID) -> Result<(RouterHandle, S
             consumer: cons,
             interleaved,
             scratch: vec![0f32; 4096],
+            resampler,
         });
         let ctx_ptr = &*ctx as *const IoProcCtx as *mut c_void;
 
@@ -238,24 +251,33 @@ unsafe extern "C" fn io_proc_trampoline(
         return 0;
     }
 
-    // Pop stereo interleaved samples from ring: [L0, R0, L1, R1, ...]
+    // Fill scratch with stereo interleaved samples [L0, R0, L1, R1, ...]
     let needed = frame_count * 2;
-    let scratch_len = ctx.scratch.len();
-    if scratch_len < needed {
+    if ctx.scratch.len() < needed {
         ctx.scratch.resize(needed, 0.0);
     }
     let scratch = &mut ctx.scratch[..needed];
-    let popped = ringbuf::traits::Consumer::pop_slice(&mut ctx.consumer, scratch);
-    // Any frames not popped stay zero (underrun → silence)
-    let frames_popped = popped / 2;
+
+    let frames_to_write = match &mut ctx.resampler {
+        None => {
+            // Passthrough: pop directly from ring; underrun frames stay zero
+            let popped = ringbuf::traits::Consumer::pop_slice(&mut ctx.consumer, scratch);
+            popped / 2
+        }
+        Some(rs) => {
+            // Resample: fills all frame_count frames (xruns become silence internally)
+            rs.process(scratch, &mut ctx.consumer);
+            frame_count
+        }
+    };
 
     if ctx.interleaved {
         // mBuffers[0], mNumberChannels == n_channels (typically 16)
         let buf = &mut *buffers_base;
         let n_ch = buf.mNumberChannels as usize;
         let data = buf.mData as *mut f32;
-        for i in 0..frames_popped {
-            *data.add(i * n_ch) = scratch[i * 2];       // ch 1 = L
+        for i in 0..frames_to_write {
+            *data.add(i * n_ch) = scratch[i * 2];          // ch 1 = L
             *data.add(i * n_ch + 1) = scratch[i * 2 + 1]; // ch 2 = R
         }
     } else {
@@ -263,14 +285,14 @@ unsafe extern "C" fn io_proc_trampoline(
         if n_buffers >= 1 {
             let buf0 = &mut *buffers_base;
             let data0 = buf0.mData as *mut f32;
-            for i in 0..frames_popped {
+            for i in 0..frames_to_write {
                 *data0.add(i) = scratch[i * 2];
             }
         }
         if n_buffers >= 2 {
             let buf1 = &mut *buffers_base.add(1);
             let data1 = buf1.mData as *mut f32;
-            for i in 0..frames_popped {
+            for i in 0..frames_to_write {
                 *data1.add(i) = scratch[i * 2 + 1];
             }
         }
