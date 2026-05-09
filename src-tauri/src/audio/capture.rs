@@ -261,6 +261,8 @@ fn build_stream_route(
     producer: SampleProducer,
     gain_bits: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
+    master_gain_bits: Arc<AtomicU32>,
+    master_muted: Arc<AtomicBool>,
     overrun_count: Arc<AtomicU64>,
     app: AppHandle,
     pid: i32,
@@ -290,6 +292,8 @@ fn build_stream_route(
 
     let g_arc = gain_bits;
     let m_arc = muted;
+    let mg_arc = master_gain_bits;
+    let mm_arc = master_muted;
     let oc = overrun_count;
     let app_for_meter = app.clone();
     let bid_for_meter = bundle_id.to_string();
@@ -329,7 +333,9 @@ fn build_stream_route(
 
             let n = channels[0].len();
             let g_raw = f32::from_bits(g_arc.load(Ordering::Relaxed));
-            let g = if m_arc.load(Ordering::Relaxed) { 0.0 } else { g_raw };
+            let mg = f32::from_bits(mg_arc.load(Ordering::Relaxed));
+            let any_muted = m_arc.load(Ordering::Relaxed) || mm_arc.load(Ordering::Relaxed);
+            let g = if any_muted { 0.0 } else { g_raw * mg };
 
             let mut scratch: Vec<f32> = Vec::with_capacity(n * 2);
             for i in 0..n {
@@ -424,6 +430,8 @@ pub fn start_routing(
         producer,
         gain_bits.clone(),
         muted.clone(),
+        rt.master_gain_bits.clone(),
+        rt.master_muted.clone(),
         overrun_count.clone(),
         app,
         pid,

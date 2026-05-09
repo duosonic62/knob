@@ -83,6 +83,29 @@ async fn set_app_settings(
     Ok(())
 }
 
+#[tauri::command]
+async fn set_master_volume(
+    volume: f32,
+    muted: bool,
+    s: State<'_, SettingsState>,
+    rt: State<'_, RoutingState>,
+) -> Result<(), String> {
+    let volume = volume.clamp(0.0, 1.0);
+
+    let snapshot = {
+        let mut g = s.inner.lock();
+        g.master = settings::MasterSettings { volume, muted };
+        g.clone()
+    };
+    settings::save(&snapshot, &s.path)?;
+
+    rt.master_gain_bits
+        .store(volume.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    rt.master_muted
+        .store(muted, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
@@ -97,6 +120,13 @@ pub fn run() {
                 .map_err(|e| format!("app_config_dir failed: {}", e))?;
             let path = dir.join("settings.json");
             let loaded = settings::load(&path);
+            let rt = app.state::<RoutingState>();
+            rt.master_gain_bits.store(
+                loaded.master.volume.to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            rt.master_muted
+                .store(loaded.master.muted, std::sync::atomic::Ordering::Relaxed);
             app.manage(SettingsState {
                 inner: parking_lot::Mutex::new(loaded),
                 path,
@@ -113,6 +143,7 @@ pub fn run() {
             stop_routing,
             get_settings,
             set_app_settings,
+            set_master_volume,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
