@@ -6,19 +6,8 @@ use settings::{Settings, SettingsState};
 use tauri::{Manager, State};
 
 #[tauri::command]
-async fn list_audio_apps(state: State<'_, CaptureState>) -> Result<Vec<AppInfo>, String> {
-    let _ = state;
+async fn list_audio_apps() -> Result<Vec<AppInfo>, String> {
     audio::capture::list_audio_apps()
-}
-
-#[tauri::command]
-async fn start_capture(bundle_id: String, state: State<'_, CaptureState>) -> Result<(), String> {
-    audio::capture::start_capture(&bundle_id, &state)
-}
-
-#[tauri::command]
-async fn stop_capture(state: State<'_, CaptureState>) -> Result<String, String> {
-    audio::capture::stop_capture(&state)
 }
 
 #[tauri::command]
@@ -40,15 +29,17 @@ async fn start_routing(
     cap: State<'_, CaptureState>,
     rt: State<'_, RoutingState>,
 ) -> Result<(), String> {
-    audio::capture::start_routing(&bundle_id, volume, muted, &cap, &rt, app)
+    audio::capture::add_route(&bundle_id, volume, muted, &cap, &rt, app)
 }
 
 #[tauri::command]
 async fn stop_routing(
+    app: tauri::AppHandle,
+    bundle_id: String,
     cap: State<'_, CaptureState>,
     rt: State<'_, RoutingState>,
 ) -> Result<(), String> {
-    audio::capture::stop_routing(&cap, &rt)
+    audio::capture::remove_route(&bundle_id, &cap, &rt, app)
 }
 
 #[tauri::command]
@@ -73,12 +64,10 @@ async fn set_app_settings(
     };
     settings::save(&snapshot, &s.path)?;
 
-    let active = rt.active.lock();
-    if let Some((rb, h)) = active.as_ref() {
-        if rb == &bundle_id {
-            audio::router::set_gain(h, volume);
-            audio::router::set_muted(h, muted);
-        }
+    let sources = rt.sources.lock();
+    if let Some(entry) = sources.get(&bundle_id) {
+        entry.gain_bits.store(volume.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        entry.muted.store(muted, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
 }
@@ -127,16 +116,39 @@ pub fn run() {
             );
             rt.master_muted
                 .store(loaded.master.muted, std::sync::atomic::Ordering::Relaxed);
+
+            let routed = loaded.routed.clone();
             app.manage(SettingsState {
                 inner: parking_lot::Mutex::new(loaded),
                 path,
+            });
+
+            // Restore previously routed apps after SettingsState is managed
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                for bundle_id in routed {
+                    let cap = app_handle.state::<CaptureState>();
+                    let rt = app_handle.state::<RoutingState>();
+                    let ss = app_handle.state::<settings::SettingsState>();
+                    let vol = ss.inner.lock().apps
+                        .get(&bundle_id)
+                        .map(|a| a.volume)
+                        .unwrap_or(0.75);
+                    let muted = ss.inner.lock().apps
+                        .get(&bundle_id)
+                        .map(|a| a.muted)
+                        .unwrap_or(false);
+                    if let Err(e) = audio::capture::add_route(
+                        &bundle_id, vol, muted, &cap, &rt, app_handle.clone(),
+                    ) {
+                        log::warn!("[knob] restore route '{}' failed: {}", bundle_id, e);
+                    }
+                }
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_audio_apps,
-            start_capture,
-            stop_capture,
             list_audio_output_devices,
             check_blackhole,
             start_routing,

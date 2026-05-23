@@ -1,9 +1,6 @@
-use std::fs::File;
-use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use hound::{SampleFormat, WavSpec, WavWriter};
 use screencapturekit::prelude::*;
 use screencapturekit::stream::delegate_trait::StreamCallbacks;
 use tauri::{AppHandle, Emitter, Manager};
@@ -13,18 +10,10 @@ extern crate libc;
 
 use super::AppInfo;
 use super::router::{self, SampleProducer};
-
-pub enum CaptureSink {
-    Wav {
-        path: String,
-        writer: Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
-    },
-    Route,
-}
+use crate::settings::SettingsState;
 
 pub struct CaptureSession {
     stream: SCStream,
-    pub sink: CaptureSink,
 }
 
 pub fn list_audio_apps() -> Result<Vec<AppInfo>, String> {
@@ -69,125 +58,6 @@ fn build_filter_and_config(
     Ok((filter, config))
 }
 
-pub fn start_capture(bundle_id: &str, state: &super::CaptureState) -> Result<(), String> {
-    let mut session = state.session.lock().unwrap();
-    if session.is_some() {
-        return Err("Capture already running. Stop it first.".to_string());
-    }
-
-    let (filter, config) = build_filter_and_config(bundle_id)?;
-
-    let safe_name = bundle_id.replace(['/', '.', ' '], "_");
-    let wav_path = format!("/tmp/knob_poc_{}.wav", safe_name);
-
-    let spec = WavSpec {
-        channels: 2,
-        sample_rate: 48000,
-        bits_per_sample: 32,
-        sample_format: SampleFormat::Float,
-    };
-    let wav = WavWriter::create(&wav_path, spec).map_err(|e| e.to_string())?;
-    let writer: Arc<Mutex<Option<WavWriter<BufWriter<File>>>>> =
-        Arc::new(Mutex::new(Some(wav)));
-    let writer_for_handler = writer.clone();
-
-    let callback_count = Arc::new(AtomicU64::new(0));
-    let callback_count_for_handler = callback_count.clone();
-
-    let mut stream = SCStream::new(&filter, &config);
-    stream.add_output_handler(
-        move |sample: CMSampleBuffer, of_type: SCStreamOutputType| {
-            if of_type != SCStreamOutputType::Audio {
-                return;
-            }
-            let Some(buf_list) = sample.audio_buffer_list() else {
-                return;
-            };
-
-            let channels: Vec<&[f32]> = buf_list
-                .iter()
-                .filter_map(|ab| {
-                    let bytes = ab.data();
-                    if bytes.is_empty() || bytes.len() % 4 != 0 {
-                        return None;
-                    }
-                    Some(unsafe {
-                        std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), bytes.len() / 4)
-                    })
-                })
-                .collect();
-
-            if channels.is_empty() {
-                return;
-            }
-
-            let count = callback_count_for_handler.fetch_add(1, Ordering::Relaxed);
-            if count % 50 == 0 {
-                let all_samples: Vec<f32> =
-                    channels.iter().flat_map(|c| c.iter().copied()).collect();
-                let rms = {
-                    let sum_sq: f64 =
-                        all_samples.iter().map(|&s| (s as f64).powi(2)).sum();
-                    (sum_sq / all_samples.len() as f64).sqrt()
-                };
-                log::info!(
-                    "[knob] audio RMS={:.6}  frames={} buffers={}",
-                    rms,
-                    channels[0].len(),
-                    channels.len()
-                );
-            }
-
-            if let Ok(mut guard) = writer_for_handler.lock() {
-                if let Some(ref mut wav) = *guard {
-                    let frame_count = channels[0].len();
-                    for frame in 0..frame_count {
-                        for ch in &channels {
-                            if frame < ch.len() {
-                                let _ = wav.write_sample(ch[frame]);
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        SCStreamOutputType::Audio,
-    );
-
-    stream.start_capture().map_err(|e| e.to_string())?;
-    log::info!("[knob] wav capture started for '{}'", bundle_id);
-
-    *session = Some(CaptureSession {
-        stream,
-        sink: CaptureSink::Wav {
-            path: wav_path,
-            writer,
-        },
-    });
-    Ok(())
-}
-
-pub fn stop_capture(state: &super::CaptureState) -> Result<String, String> {
-    let mut session = state.session.lock().unwrap();
-    let sess = session.take().ok_or("No capture running")?;
-
-    sess.stream.stop_capture().map_err(|e| e.to_string())?;
-
-    let path = match sess.sink {
-        CaptureSink::Wav { path, writer } => {
-            let mut guard = writer.lock().unwrap();
-            if let Some(wav) = guard.take() {
-                wav.finalize().map_err(|e| e.to_string())?;
-            }
-            path
-        }
-        CaptureSink::Route { .. } => String::new(),
-    };
-
-    log::info!("[knob] capture stopped. WAV saved to {}", path);
-    Ok(path)
-}
-
 fn start_exit_watch(app: AppHandle, bundle_id: String, pid: i32) {
     std::thread::Builder::new()
         .name(format!("exit-watch-{}", bundle_id))
@@ -195,17 +65,13 @@ fn start_exit_watch(app: AppHandle, bundle_id: String, pid: i32) {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
 
-                // Bail if this bundle is no longer the active route
                 {
                     let rt = app.state::<super::RoutingState>();
-                    let active = rt.active.lock();
-                    match active.as_ref() {
-                        Some((bid, _)) if bid == &bundle_id => {}
-                        _ => break,
+                    if !rt.sources.lock().contains_key(&bundle_id) {
+                        break;
                     }
                 }
 
-                // kill(pid, 0) returns 0 if process exists, -1 (ESRCH) if not
                 let process_exists = unsafe { libc::kill(pid, 0) == 0 };
                 if !process_exists {
                     log::info!("[knob] process exit detected: bundle={} pid={}", bundle_id, pid);
@@ -219,36 +85,7 @@ fn start_exit_watch(app: AppHandle, bundle_id: String, pid: i32) {
 
 fn handle_sck_termination(app: AppHandle, bundle_id: String) {
     tauri::async_runtime::spawn(async move {
-        let cap = app.state::<super::CaptureState>();
-        let rt = app.state::<super::RoutingState>();
-
-        // Lock order must match stop_routing: cap.session → rt.active (deadlock prevention)
-        let mut session_lock = match cap.session.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let mut active_lock = rt.active.lock();
-
-        // Take only if this bundle is still the active route (race-free under both locks)
-        let bundle_match = matches!(
-            active_lock.as_ref(),
-            Some((bid, _)) if bid == &bundle_id
-        );
-        if !bundle_match {
-            return;
-        }
-        let _session_dropped = session_lock.take(); // SCStream drop; SCK already stopped
-        let handle = active_lock.take().map(|(_, h)| h);
-
-        // Release locks before CoreAudio calls (AudioDeviceStop can block)
-        drop(active_lock);
-        drop(session_lock);
-
-        if let Some(h) = handle {
-            if let Err(e) = router::close_route(h) {
-                log::warn!("[knob] close_route after SCK termination failed: {}", e);
-            }
-        }
+        remove_route_internal(&bundle_id, app.clone()).await;
         if let Err(e) = app.emit("routing-stopped", &bundle_id) {
             log::warn!("[knob] emit routing-stopped failed: {}", e);
         }
@@ -256,6 +93,67 @@ fn handle_sck_termination(app: AppHandle, bundle_id: String) {
     });
 }
 
+/// Shared teardown: stop SCK → update snapshot → close IOProc if last.
+async fn remove_route_internal(bundle_id: &str, app: AppHandle) {
+    let cap = app.state::<super::CaptureState>();
+    let rt = app.state::<super::RoutingState>();
+
+    // 1. Take the SCK session for this bundle (no lock held while stopping)
+    let session = cap.sessions.lock().remove(bundle_id);
+
+    // 2. Stop SCK so producer stops pushing before consumer is removed
+    if let Some(sess) = session {
+        if let Err(e) = sess.stream.stop_capture() {
+            log::warn!("[knob] stop_capture for '{}' failed: {}", bundle_id, e);
+        }
+    }
+
+    // 3. Remove SourceEntry from map
+    let removed_entry = rt.sources.lock().remove(bundle_id);
+
+    // 4. Update snapshot: rebuild Vec excluding this source
+    if let Some(entry) = removed_entry {
+        let ptr = Arc::as_ptr(&entry.mix_source);
+        let new_vec: Vec<_> = rt
+            .mix_snapshot
+            .load()
+            .iter()
+            .filter(|a| Arc::as_ptr(a) != ptr)
+            .cloned()
+            .collect();
+        let sources_empty = new_vec.is_empty();
+        rt.mix_snapshot.store(Arc::new(new_vec));
+
+        // 5. Close IOProc when last source is removed
+        if sources_empty {
+            if let Some(h) = rt.io_proc.lock().take() {
+                if let Err(e) = router::close_io_proc(h) {
+                    log::warn!("[knob] close_io_proc after '{}' failed: {}", bundle_id, e);
+                }
+            }
+        }
+    }
+
+    // Persist routed set
+    if let Some(ss) = app.try_state::<SettingsState>() {
+        let snapshot = {
+            let mut g = ss.inner.lock();
+            g.routed.retain(|b| b != bundle_id);
+            g.clone()
+        };
+        if let Err(e) = crate::settings::save(&snapshot, &ss.path) {
+            log::warn!("[knob] remove_route: failed to save settings: {}", e);
+        }
+    }
+
+    log::info!(
+        "[knob] remove_route: '{}' done, sources_remaining={}",
+        bundle_id,
+        rt.sources.lock().len()
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_stream_route(
     bundle_id: &str,
     producer: SampleProducer,
@@ -285,7 +183,6 @@ fn build_stream_route(
             handle_sck_termination(app_for_err.clone(), bid_for_err.clone());
         })
         .on_inactive(move || {
-            // Fires when all shared windows are gone (target app quit)
             log::info!("[knob] SCK stream became inactive bundle={}", bid_for_inactive);
             handle_sck_termination(app_for_inactive.clone(), bid_for_inactive.clone());
         });
@@ -298,8 +195,6 @@ fn build_stream_route(
     let app_for_meter = app.clone();
     let bid_for_meter = bundle_id.to_string();
     let meter_count = AtomicU64::new(0);
-    // SCK requires Fn (not FnMut); wrap producer in Mutex for interior mutability.
-    // SCK calls from a single dispatch queue so this is always uncontended.
     let producer = parking_lot::Mutex::new(producer);
 
     start_exit_watch(app.clone(), bundle_id.to_string(), pid);
@@ -318,7 +213,7 @@ fn build_stream_route(
                 .iter()
                 .filter_map(|ab| {
                     let bytes = ab.data();
-                    if bytes.is_empty() || bytes.len() % 4 != 0 {
+                    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
                         return None;
                     }
                     Some(unsafe {
@@ -348,7 +243,7 @@ fn build_stream_route(
             let pushed = ringbuf::traits::Producer::push_slice(&mut *producer.lock(), &scratch);
             if pushed < scratch.len() {
                 let prev = oc.fetch_add(1, Ordering::Relaxed);
-                if prev % 50 == 0 {
+                if prev.is_multiple_of(50) {
                     log::warn!(
                         "[knob] ring overrun: dropped {} samples",
                         scratch.len() - pushed
@@ -357,7 +252,7 @@ fn build_stream_route(
             }
 
             let mc = meter_count.fetch_add(1, Ordering::Relaxed);
-            if mc % 10 == 0 {
+            if mc.is_multiple_of(10) {
                 let sum_sq: f64 = scratch.iter().map(|&s| (s as f64).powi(2)).sum();
                 let rms = if scratch.is_empty() {
                     0.0
@@ -379,7 +274,8 @@ fn build_stream_route(
     Ok(stream)
 }
 
-pub fn start_routing(
+/// Add a new route for bundle_id. Multiple concurrent routes are supported.
+pub fn add_route(
     bundle_id: &str,
     initial_volume: f32,
     initial_muted: bool,
@@ -387,16 +283,12 @@ pub fn start_routing(
     rt: &super::RoutingState,
     app: AppHandle,
 ) -> Result<(), String> {
-    let mut session = cap.session.lock().unwrap();
-    if session.is_some() {
-        return Err("Capture already running. Stop it first.".to_string());
-    }
-    let mut active_lock = rt.active.lock();
-    if active_lock.is_some() {
-        return Err("Routing already active. Stop it first.".to_string());
+    // Reject duplicate routes for the same bundle
+    if rt.sources.lock().contains_key(bundle_id) {
+        return Err(format!("'{}' is already being routed", bundle_id));
     }
 
-    // Get target app PID for process exit monitoring
+    // Get target app PID
     let pid = {
         let content = SCShareableContent::get().map_err(|e| e.to_string())?;
         content
@@ -414,31 +306,52 @@ pub fn start_routing(
     }
     let device_id = bh.devices[0].id;
 
-    // Open HAL IOProc route
-    let (handle, producer) = router::open_blackhole_route(device_id)?;
+    // Open IOProc on first route
+    let is_first = rt.io_proc.lock().is_none();
+    if is_first {
+        let io_proc = router::open_io_proc(device_id, rt.mix_snapshot.clone())?;
+        *rt.io_proc.lock() = Some(io_proc);
+    }
 
-    // Apply initial volume/mute before SCK starts (prevents audio jump race)
-    router::set_gain(&handle, initial_volume);
-    router::set_muted(&handle, initial_muted);
+    // Query device sample rate; build per-source ring + optional resampler
+    let rate = router::query_device_sample_rate(device_id).unwrap_or(48000.0);
+    let (mix_source, producer) = match router::build_source(rate) {
+        Ok(v) => v,
+        Err(e) => {
+            if is_first {
+                if let Some(h) = rt.io_proc.lock().take() {
+                    let _ = router::close_io_proc(h);
+                }
+            }
+            return Err(e);
+        }
+    };
 
-    let gain_bits = handle.gain_bits.clone();
-    let muted = handle.muted.clone();
+    // Register source in snapshot BEFORE starting SCK capture
+    {
+        let mut v = rt.mix_snapshot.load().as_ref().clone();
+        v.push(mix_source.clone());
+        rt.mix_snapshot.store(Arc::new(v));
+    }
+
+    let gain_bits = Arc::new(AtomicU32::new(initial_volume.to_bits()));
+    let muted_arc = Arc::new(AtomicBool::new(initial_muted));
     let overrun_count = Arc::new(AtomicU64::new(0));
 
     let stream = match build_stream_route(
         bundle_id,
         producer,
         gain_bits.clone(),
-        muted.clone(),
+        muted_arc.clone(),
         rt.master_gain_bits.clone(),
         rt.master_muted.clone(),
-        overrun_count.clone(),
-        app,
+        overrun_count,
+        app.clone(),
         pid,
     ) {
         Ok(s) => s,
         Err(e) => {
-            let _ = router::close_route(handle);
+            rollback_snapshot(rt, &mix_source, is_first);
             return Err(e);
         }
     };
@@ -446,35 +359,72 @@ pub fn start_routing(
     match stream.start_capture() {
         Ok(_) => {}
         Err(e) => {
-            let _ = router::close_route(handle);
+            rollback_snapshot(rt, &mix_source, is_first);
             return Err(e.to_string());
         }
     }
 
-    log::info!("[knob] routing started for '{}'", bundle_id);
+    cap.sessions.lock().insert(
+        bundle_id.to_string(),
+        CaptureSession { stream },
+    );
+    rt.sources.lock().insert(
+        bundle_id.to_string(),
+        super::SourceEntry { gain_bits, muted: muted_arc, mix_source },
+    );
 
-    *session = Some(CaptureSession {
-        stream,
-        sink: CaptureSink::Route,
-    });
-    *active_lock = Some((bundle_id.to_string(), handle));
+    // Persist routed set
+    if let Some(ss) = app.try_state::<SettingsState>() {
+        let snapshot = {
+            let mut g = ss.inner.lock();
+            if !g.routed.contains(&bundle_id.to_string()) {
+                g.routed.push(bundle_id.to_string());
+            }
+            g.clone()
+        };
+        if let Err(e) = crate::settings::save(&snapshot, &ss.path) {
+            log::warn!("[knob] add_route: failed to save settings: {}", e);
+        }
+    }
+
+    log::info!(
+        "[knob] add_route: '{}' started, sources_total={}",
+        bundle_id,
+        rt.sources.lock().len()
+    );
+
     Ok(())
 }
 
-pub fn stop_routing(
-    cap: &super::CaptureState,
-    rt: &super::RoutingState,
+/// Remove a route by bundle_id. No-op if not active.
+pub fn remove_route(
+    bundle_id: &str,
+    _cap: &super::CaptureState,
+    _rt: &super::RoutingState,
+    app: AppHandle,
 ) -> Result<(), String> {
-    let mut session = cap.session.lock().unwrap();
-    let sess = session.take().ok_or("No routing active")?;
-
-    // Stop SCK first so producer stops pushing before IOProc consumer is torn down
-    sess.stream.stop_capture().map_err(|e| e.to_string())?;
-
-    if let Some((_, handle)) = rt.active.lock().take() {
-        router::close_route(handle)?;
-    }
-
-    log::info!("[knob] routing stopped");
+    tauri::async_runtime::block_on(remove_route_internal(bundle_id, app));
     Ok(())
+}
+
+fn rollback_snapshot(
+    rt: &super::RoutingState,
+    mix_source: &Arc<super::router::MixSource>,
+    was_first: bool,
+) {
+    let ptr = Arc::as_ptr(mix_source);
+    let new_vec: Vec<_> = rt
+        .mix_snapshot
+        .load()
+        .iter()
+        .filter(|a| Arc::as_ptr(a) != ptr)
+        .cloned()
+        .collect();
+    let now_empty = new_vec.is_empty();
+    rt.mix_snapshot.store(Arc::new(new_vec));
+    if was_first && now_empty {
+        if let Some(h) = rt.io_proc.lock().take() {
+            let _ = router::close_io_proc(h);
+        }
+    }
 }

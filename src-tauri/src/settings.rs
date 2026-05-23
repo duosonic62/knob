@@ -37,11 +37,18 @@ pub struct Settings {
     pub apps: HashMap<String, AppSettings>,
     #[serde(default)]
     pub master: MasterSettings,
+    #[serde(default)]
+    pub routed: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { version: SETTINGS_VERSION, apps: HashMap::new(), master: MasterSettings::default() }
+        Self {
+            version: SETTINGS_VERSION,
+            apps: HashMap::new(),
+            master: MasterSettings::default(),
+            routed: Vec::new(),
+        }
     }
 }
 
