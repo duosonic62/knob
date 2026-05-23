@@ -30,9 +30,7 @@
   onMount(async () => {
     await recheck();
     unlistenStopped = await listen<string>("routing-stopped", ({ payload }) => {
-      if (routedBundleId === payload) {
-        routedBundleId = null;
-      }
+      routedBundleIds = new Set([...routedBundleIds].filter((b) => b !== payload));
       const stopped = apps.find((a) => a.bundle_id === payload);
       if (stopped) stopped.level = 0;
       const name = stopped?.name ?? payload;
@@ -59,11 +57,12 @@
     version: number;
     apps: Record<string, AppSettings>;
     master?: MasterSettings;
+    routed?: string[];
   };
 
   let apps = $state<Strip[]>([]);
-  let routedBundleId = $state<string | null>(null);
-  let busy = $state(false);
+  let routedBundleIds = $state<Set<string>>(new Set());
+  let busyBundles = $state<Set<string>>(new Set());
   let routeError = $state<string | null>(null);
   let routeInfo = $state<string | null>(null);
 
@@ -80,6 +79,8 @@
       masterVolume = Math.round(blob.master.volume * 100);
       masterMuted = blob.master.muted;
     }
+    // Sync routed state with backend-restored set
+    routedBundleIds = new Set(blob.routed ?? []);
     settingsLoaded = true;
   }
 
@@ -126,38 +127,34 @@
   }
 
   async function onRoute(bundleId: string) {
-    busy = true;
+    busyBundles = new Set([...busyBundles, bundleId]);
     routeError = null;
     try {
-      if (routedBundleId) {
-        await invoke("stop_routing");
-        routedBundleId = null;
-      }
       const s = apps.find((a) => a.bundle_id === bundleId)!;
       await invoke("start_routing", {
         bundleId,
         volume: s.volume / 100,
         muted: s.muted,
       });
-      routedBundleId = bundleId;
+      routedBundleIds = new Set([...routedBundleIds, bundleId]);
     } catch (e) {
       routeError = String(e);
     } finally {
-      busy = false;
+      busyBundles = new Set([...busyBundles].filter((b) => b !== bundleId));
     }
   }
 
-  async function onStop() {
-    busy = true;
+  async function onStop(bundleId: string) {
+    busyBundles = new Set([...busyBundles, bundleId]);
     try {
-      await invoke("stop_routing");
-      const s = apps.find((a) => a.bundle_id === routedBundleId);
+      await invoke("stop_routing", { bundleId });
+      const s = apps.find((a) => a.bundle_id === bundleId);
       if (s) s.level = 0;
-      routedBundleId = null;
+      routedBundleIds = new Set([...routedBundleIds].filter((b) => b !== bundleId));
     } catch (e) {
       routeError = String(e);
     } finally {
-      busy = false;
+      busyBundles = new Set([...busyBundles].filter((b) => b !== bundleId));
     }
   }
 
@@ -207,7 +204,7 @@
   <main>
     <div class="toolbar">
       <h1>Knob Mixer</h1>
-      <button class="refresh" onclick={refreshApps} disabled={busy}>アプリ一覧を更新</button>
+      <button class="refresh" onclick={refreshApps} disabled={busyBundles.size > 0}>アプリ一覧を更新</button>
     </div>
 
     <div class="master" class:muted={masterMuted}>
@@ -249,14 +246,14 @@
           name={app.name}
           volume={app.volume}
           muted={app.muted}
-          routing={routedBundleId === app.bundle_id}
-          disabled={busy}
+          routing={routedBundleIds.has(app.bundle_id)}
+          disabled={busyBundles.has(app.bundle_id)}
           level={app.level}
-          showMeter={routedBundleId === app.bundle_id}
+          showMeter={routedBundleIds.has(app.bundle_id)}
           onVolumeChange={(v) => onVolume(app.bundle_id, v)}
           onToggleMute={() => onMute(app.bundle_id)}
           onRoute={() => onRoute(app.bundle_id)}
-          onStop={onStop}
+          onStop={() => onStop(app.bundle_id)}
         />
       {/each}
 
