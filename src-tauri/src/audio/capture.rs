@@ -85,7 +85,7 @@ fn start_exit_watch(app: AppHandle, bundle_id: String, pid: i32) {
 
 fn handle_sck_termination(app: AppHandle, bundle_id: String) {
     tauri::async_runtime::spawn(async move {
-        remove_route_internal(&bundle_id, app.clone()).await;
+        remove_route_internal(&bundle_id, app.clone());
         if let Err(e) = app.emit("routing-stopped", &bundle_id) {
             log::warn!("[knob] emit routing-stopped failed: {}", e);
         }
@@ -94,7 +94,7 @@ fn handle_sck_termination(app: AppHandle, bundle_id: String) {
 }
 
 /// Shared teardown: stop SCK → update snapshot → close IOProc if last.
-async fn remove_route_internal(bundle_id: &str, app: AppHandle) {
+fn remove_route_internal(bundle_id: &str, app: AppHandle) {
     let cap = app.state::<super::CaptureState>();
     let rt = app.state::<super::RoutingState>();
 
@@ -403,7 +403,7 @@ pub fn remove_route(
     _rt: &super::RoutingState,
     app: AppHandle,
 ) -> Result<(), String> {
-    tauri::async_runtime::block_on(remove_route_internal(bundle_id, app));
+    remove_route_internal(bundle_id, app);
     Ok(())
 }
 
