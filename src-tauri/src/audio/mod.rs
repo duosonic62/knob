@@ -4,7 +4,8 @@ pub mod resampler;
 pub mod router;
 
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Serialize, Clone)]
 pub struct AppInfo {
@@ -45,12 +46,16 @@ impl Default for CaptureState {
 
 pub struct RoutingState {
     pub active: parking_lot::Mutex<Option<(String, router::RouterHandle)>>,
+    pub master_gain_bits: Arc<AtomicU32>,
+    pub master_muted: Arc<AtomicBool>,
 }
 
 impl Default for RoutingState {
     fn default() -> Self {
         Self {
             active: parking_lot::Mutex::new(None),
+            master_gain_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            master_muted: Arc::new(AtomicBool::new(false)),
         }
     }
 }

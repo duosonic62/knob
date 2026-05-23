@@ -54,7 +54,12 @@
   type AppInfo = { bundle_id: string; name: string; pid: number };
   type Strip = AppInfo & { volume: number; muted: boolean; level: number };
   type AppSettings = { volume: number; muted: boolean };
-  type SettingsBlob = { version: number; apps: Record<string, AppSettings> };
+  type MasterSettings = { volume: number; muted: boolean };
+  type SettingsBlob = {
+    version: number;
+    apps: Record<string, AppSettings>;
+    master?: MasterSettings;
+  };
 
   let apps = $state<Strip[]>([]);
   let routedBundleId = $state<string | null>(null);
@@ -62,13 +67,42 @@
   let routeError = $state<string | null>(null);
   let routeInfo = $state<string | null>(null);
 
+  let masterVolume = $state(100);
+  let masterMuted = $state(false);
+
   let savedSettings = $state<Record<string, AppSettings>>({});
   let settingsLoaded = false;
 
   async function loadSettings() {
     const blob = await invoke<SettingsBlob>("get_settings");
     savedSettings = blob.apps ?? {};
+    if (blob.master) {
+      masterVolume = Math.round(blob.master.volume * 100);
+      masterMuted = blob.master.muted;
+    }
     settingsLoaded = true;
+  }
+
+  async function persistMaster(volume: number, muted: boolean) {
+    await invoke("set_master_volume", { volume: volume / 100, muted });
+  }
+
+  async function onMasterVolume(v: number) {
+    masterVolume = v;
+    try {
+      await persistMaster(v, masterMuted);
+    } catch (e) {
+      routeError = String(e);
+    }
+  }
+
+  async function onMasterMute() {
+    masterMuted = !masterMuted;
+    try {
+      await persistMaster(masterVolume, masterMuted);
+    } catch (e) {
+      routeError = String(e);
+    }
   }
 
   async function refreshApps() {
@@ -174,6 +208,25 @@
     <div class="toolbar">
       <h1>Knob Mixer</h1>
       <button class="refresh" onclick={refreshApps} disabled={busy}>アプリ一覧を更新</button>
+    </div>
+
+    <div class="master" class:muted={masterMuted}>
+      <span class="master-label">Master</span>
+      <input
+        type="range"
+        min="0"
+        max="100"
+        step="1"
+        value={masterVolume}
+        oninput={(e) => onMasterVolume(Number(e.currentTarget.value))}
+        aria-label="master volume"
+      />
+      <span class="master-value">{masterVolume}</span>
+      <button
+        class="master-mute"
+        aria-pressed={masterMuted}
+        onclick={onMasterMute}
+      >{masterMuted ? "Unmute" : "Mute"}</button>
     </div>
 
     {#if routeError}
@@ -350,6 +403,56 @@
       padding: 0;
       line-height: 1;
     }
+  }
+
+  .master {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 0.9rem;
+    margin-bottom: 1rem;
+    background: var(--strip-bg);
+    border: 1px solid var(--strip-border);
+    border-radius: 6px;
+  }
+
+  .master.muted {
+    opacity: 0.6;
+  }
+
+  .master-label {
+    font-weight: 600;
+    font-size: 0.9rem;
+    min-width: 4rem;
+  }
+
+  .master input[type="range"] {
+    flex: 1;
+    accent-color: var(--accent);
+  }
+
+  .master-value {
+    font-variant-numeric: tabular-nums;
+    font-size: 0.85rem;
+    min-width: 2.5em;
+    text-align: right;
+    color: var(--text-muted);
+  }
+
+  .master-mute {
+    padding: 0.3rem 0.8rem;
+    font-size: 0.82rem;
+    border: 1px solid var(--strip-border);
+    border-radius: 4px;
+    background: var(--btn-bg);
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .master-mute[aria-pressed="true"] {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
   }
 
   .checking {

@@ -20,14 +20,28 @@ impl Default for AppSettings {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MasterSettings {
+    pub volume: f32,
+    pub muted: bool,
+}
+
+impl Default for MasterSettings {
+    fn default() -> Self {
+        Self { volume: 1.0, muted: false }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
     pub version: u32,
     pub apps: HashMap<String, AppSettings>,
+    #[serde(default)]
+    pub master: MasterSettings,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { version: SETTINGS_VERSION, apps: HashMap::new() }
+        Self { version: SETTINGS_VERSION, apps: HashMap::new(), master: MasterSettings::default() }
     }
 }
 
