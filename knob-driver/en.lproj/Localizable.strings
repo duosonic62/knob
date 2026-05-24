@@ -1,0 +1,14 @@
+/*
+See the LICENSE.txt file for this sample’s licensing information.
+
+Abstract:
+Localized strings displayed by the device.
+*/
+
+DeviceName = "Knob";
+InputStreamName = "Knob Input";
+OutputStreamName = "Knob Output";
+ManufacturerName = "duosonic62";
+MasterElementName = "Master";
+LeftElementName = "Left";
+RightElementName = "Right";
