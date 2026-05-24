@@ -16,10 +16,17 @@ A minimal user-space driver.
 //	System Includes
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <dispatch/dispatch.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syslog.h>
+#include <unistd.h>
 
 //==================================================================================================
 #pragma mark -
@@ -144,6 +151,148 @@ static UInt64								gDevice_IOIsRunning				= 0;
 //	loopback ring: 2ch interleaved Float32, kDevice_RingBufferSize frames.
 //	出力に書かれた音をここへ貯め、入力 read で読み返すことで素通し loopback を実現する。
 static Float32								gDevice_RingBuffer[kDevice_RingBufferSize * 2];
+
+//==================================================================================================
+#pragma mark Knob host IPC (shared memory override)
+//==================================================================================================
+//	When the Knob host app is running it publishes a shared-memory ring of mixed PCM and hands the
+//	region's name to the driver via the custom property kKnob_CustomProperty_ShmConfig. While that
+//	mapping is active and has data, ReadInput returns the host mix instead of the internal loopback.
+//	If the host stops (the ring drains) or disconnects, ReadInput falls back to the loopback.
+
+#define										kKnob_IPC_Magic					0x4B4E4F42u		// 'KNOB'
+#define										kKnob_IPC_ProtocolVersion		1u
+#define										kKnob_ShmNameMax				64
+static const AudioObjectPropertySelector	kKnob_CustomProperty_ShmConfig	= 'Kibp';
+
+//	Payload carried by the custom property (CFData). C ABI shared with the Rust host.
+struct KnobShmConfig
+{
+	uint32_t	magic;				// kKnob_IPC_Magic
+	uint32_t	protocol_version;	// kKnob_IPC_ProtocolVersion
+	char		name[kKnob_ShmNameMax];	// POSIX shm name, e.g. "/knob.mix.1234"; name[0]==0 ⇒ disconnect
+};
+
+//	Header at the start of the shared-memory region, followed by ring_frames*channels Float32 samples.
+struct KnobShmHeader
+{
+	uint32_t			magic;				// kKnob_IPC_Magic
+	uint32_t			protocol_version;	// kKnob_IPC_ProtocolVersion
+	uint32_t			sample_rate;
+	uint32_t			channels;			// 2
+	uint32_t			ring_frames;		// ring capacity in frames
+	uint32_t			_pad;
+	_Atomic uint64_t	write_index;		// frames written by host (producer)
+	_Atomic uint64_t	read_index;			// frames read by driver (consumer)
+	_Atomic uint64_t	heartbeat;			// host bumps each write; used by Phase 1 staleness detection
+};
+
+//	Realtime ReadInput reads this atomically. Non-NULL ⇒ host override mapping is active.
+static _Atomic(struct KnobShmHeader*)		gKnob_ShmHeader					= NULL;
+
+//	Diagnostics returned to the host via the 'Kibp' Get (written on the control thread only).
+struct KnobIpcStatus
+{
+	uint32_t	override_active;	// 1 if a host mapping is currently published
+	int32_t		last_stage;			// 0 none, 1 bad/none CFData, 2 bad magic/ver/name, 3 shm_open fail, 4 fstat/size fail, 5 mmap fail, 6 bad header, 7 success
+	int32_t		last_errno;			// errno from the last failed shm_open/mmap
+	uint32_t	last_config_len;	// byte length of the last Set payload (0 ⇒ not a CFData)
+};
+static struct KnobIpcStatus					gKnob_Status					= { 0, 0, 0, 0 };
+
+//	Apply a shm config received via the custom property (control thread, not realtime). A valid config
+//	maps the named region and publishes it; an invalid/disconnect config reverts to loopback.
+static void	Knob_ApplyShmConfig(CFDataRef inData)
+{
+	bool theIsData = (inData != NULL) && (CFGetTypeID(inData) == CFDataGetTypeID());
+	gKnob_Status.last_config_len = theIsData ? (uint32_t)CFDataGetLength(inData) : 0;
+
+	struct KnobShmConfig theConfig;
+	bool theValid = theIsData && (CFDataGetLength(inData) == (CFIndex)sizeof(theConfig));
+	if(theValid)
+	{
+		memcpy(&theConfig, CFDataGetBytePtr(inData), sizeof(theConfig));
+		theValid =	(theConfig.magic == kKnob_IPC_Magic) &&
+					(theConfig.protocol_version == kKnob_IPC_ProtocolVersion) &&
+					(theConfig.name[0] == '/');
+		if(!theValid)
+		{
+			gKnob_Status.last_stage = 2;
+		}
+	}
+	else
+	{
+		gKnob_Status.last_stage = 1;
+	}
+	if(!theValid)
+	{
+		//	disconnect / invalid / version mismatch ⇒ revert to loopback
+		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+		gKnob_Status.override_active = 0;
+		return;
+	}
+
+	theConfig.name[kKnob_ShmNameMax - 1] = '\0';
+	int theFd = shm_open(theConfig.name, O_RDWR, 0);
+	if(theFd < 0)
+	{
+		gKnob_Status.last_stage = 3;
+		gKnob_Status.last_errno = errno;
+		DebugMsg("Knob_ApplyShmConfig: shm_open failed for %s (errno %d)", theConfig.name, errno);
+		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+		gKnob_Status.override_active = 0;
+		return;
+	}
+
+	struct stat theStat;
+	void* theBase = MAP_FAILED;
+	if((fstat(theFd, &theStat) == 0) && ((size_t)theStat.st_size >= sizeof(struct KnobShmHeader)))
+	{
+		theBase = mmap(NULL, (size_t)theStat.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, theFd, 0);
+		if(theBase == MAP_FAILED)
+		{
+			gKnob_Status.last_stage = 5;
+			gKnob_Status.last_errno = errno;
+		}
+	}
+	else
+	{
+		gKnob_Status.last_stage = 4;
+		gKnob_Status.last_errno = errno;
+	}
+	close(theFd);	//	the mapping survives closing the descriptor
+
+	if(theBase == MAP_FAILED)
+	{
+		DebugMsg("Knob_ApplyShmConfig: fstat/mmap failed");
+		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+		gKnob_Status.override_active = 0;
+		return;
+	}
+
+	struct KnobShmHeader* theHeader = (struct KnobShmHeader*)theBase;
+	if(	(theHeader->magic != kKnob_IPC_Magic) ||
+		(theHeader->protocol_version != kKnob_IPC_ProtocolVersion) ||
+		(theHeader->channels != 2) ||
+		(theHeader->ring_frames == 0))
+	{
+		//	Safe to unmap: this mapping was never published to the realtime reader.
+		munmap(theBase, (size_t)theStat.st_size);
+		gKnob_Status.last_stage = 6;
+		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+		gKnob_Status.override_active = 0;
+		return;
+	}
+
+	//	NOTE (PoC / Issue #31 Phase 0): any previously published mapping is intentionally leaked here
+	//	to avoid a use-after-unmap race with the realtime ReadInput thread. Phase 1 replaces this with
+	//	safe reclamation (generation/grace period).
+	atomic_store_explicit(&gKnob_ShmHeader, theHeader, memory_order_release);
+	gKnob_Status.last_stage = 7;
+	gKnob_Status.last_errno = 0;
+	gKnob_Status.override_active = 1;
+	DebugMsg("Knob_ApplyShmConfig: host override ON (%u frames, %u Hz)", theHeader->ring_frames, theHeader->sample_rate);
+}
 static Float64								gDevice_HostTicksPerFrame		= 0.0;
 static UInt64								gDevice_NumberTimeStamps		= 0;
 static Float64								gDevice_AnchorSampleTime		= 0.0;
@@ -866,6 +1015,7 @@ static Boolean	NullAudio_HasPlugInProperty(AudioServerPlugInDriverRef inDriver, 
 		case kAudioPlugInPropertyResourceBundle:
 		case kAudioObjectPropertyCustomPropertyInfoList:
 		case kPlugIn_CustomPropertyID:
+		case kKnob_CustomProperty_ShmConfig:
 			theAnswer = true;
 			break;
 	};
@@ -910,9 +1060,10 @@ static OSStatus	NullAudio_IsPlugInPropertySettable(AudioServerPlugInDriverRef in
 			break;
 		
 		case kPlugIn_CustomPropertyID:
+		case kKnob_CustomProperty_ShmConfig:
 			*outIsSettable = true;
 			break;
-		
+
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
 			break;
@@ -997,9 +1148,9 @@ static OSStatus	NullAudio_GetPlugInPropertyDataSize(AudioServerPlugInDriverRef i
 			break;
 			
 		case kAudioObjectPropertyCustomPropertyInfoList:
-			*outDataSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+			*outDataSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			break;
-			
+
 		case kPlugIn_CustomPropertyID:
 			FailWithAction(inQualifierDataSize != sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyDataSize: the qualifier is the wrong size for kPlugIn_CustomPropertyID");
 			FailWithAction(inQualifierData == NULL, theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyDataSize: no qualifier for kPlugIn_CustomPropertyID");
@@ -1007,7 +1158,12 @@ static OSStatus	NullAudio_GetPlugInPropertyDataSize(AudioServerPlugInDriverRef i
 			CFShow(*((CFPropertyListRef*)inQualifierData));
 			*outDataSize = sizeof(CFPropertyListRef);
 			break;
-			
+
+		case kKnob_CustomProperty_ShmConfig:
+			//	Get returns a CFData status payload (see GetPlugInPropertyData).
+			*outDataSize = sizeof(CFPropertyListRef);
+			break;
+
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
 			break;
@@ -1190,16 +1346,18 @@ static OSStatus	NullAudio_GetPlugInPropertyData(AudioServerPlugInDriverRef inDri
 			
 		case kAudioObjectPropertyCustomPropertyInfoList:
 			//	This property returns an array of AudioServerPlugInCustomPropertyInfo's that
-			//	describe the type of data used by any custom properties. For this example,
-			//	the plug-in supports a single property whose data type is a CFString and
-			//	whose qualifier is a CFString.
-			FailWithAction(inDataSize < sizeof(AudioServerPlugInCustomPropertyInfo), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: not enough space for the return value of kAudioObjectPropertyCustomPropertyInfoList");
-			((AudioServerPlugInCustomPropertyInfo*)outData)->mSelector = kPlugIn_CustomPropertyID;
-			((AudioServerPlugInCustomPropertyInfo*)outData)->mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFString;
-			((AudioServerPlugInCustomPropertyInfo*)outData)->mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
-			*outDataSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+			//	describe the type of data used by any custom properties. The sample's 'PCst'
+			//	(CFString) and Knob's 'Kibp' shm-config (CFData carried as a CFPropertyList).
+			FailWithAction(inDataSize < 2 * sizeof(AudioServerPlugInCustomPropertyInfo), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: not enough space for the return value of kAudioObjectPropertyCustomPropertyInfoList");
+			((AudioServerPlugInCustomPropertyInfo*)outData)[0].mSelector = kPlugIn_CustomPropertyID;
+			((AudioServerPlugInCustomPropertyInfo*)outData)[0].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFString;
+			((AudioServerPlugInCustomPropertyInfo*)outData)[0].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+			((AudioServerPlugInCustomPropertyInfo*)outData)[1].mSelector = kKnob_CustomProperty_ShmConfig;
+			((AudioServerPlugInCustomPropertyInfo*)outData)[1].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+			((AudioServerPlugInCustomPropertyInfo*)outData)[1].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+			*outDataSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			break;
-			
+
 		case kPlugIn_CustomPropertyID:
 			FailWithAction(inDataSize < sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: not enough space for the return value of kPlugIn_CustomPropertyID");
 			FailWithAction(inQualifierDataSize != sizeof(CFPropertyListRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: the qualifier is the wrong size for kPlugIn_CustomPropertyID");
@@ -1209,7 +1367,16 @@ static OSStatus	NullAudio_GetPlugInPropertyData(AudioServerPlugInDriverRef inDri
 			*((CFStringRef*)outData) = CFSTR("NullAudio PlugIn Custom Property");
 			*outDataSize = sizeof(CFStringRef);
 			break;
-			
+
+		case kKnob_CustomProperty_ShmConfig:
+			//	Return a CFData carrying KnobIpcStatus diagnostics (override flag, last failure stage,
+			//	errno, last config length). Created with the Create rule; the HAL releases it.
+			FailWithAction(inDataSize < sizeof(CFPropertyListRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: not enough space for the return value of kKnob_CustomProperty_ShmConfig");
+			gKnob_Status.override_active = (atomic_load_explicit(&gKnob_ShmHeader, memory_order_acquire) != NULL) ? 1 : 0;
+			*((CFDataRef*)outData) = CFDataCreate(NULL, (const UInt8*)&gKnob_Status, (CFIndex)sizeof(gKnob_Status));
+			*outDataSize = sizeof(CFPropertyListRef);
+			break;
+
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
 			break;
@@ -1250,7 +1417,13 @@ static OSStatus	NullAudio_SetPlugInPropertyData(AudioServerPlugInDriverRef inDri
 			DebugMsg("NullAudio_SetPlugInPropertyData: the data passed to us was:");
 			CFShow(*((CFStringRef*)inData));
 			break;
-			
+
+		case kKnob_CustomProperty_ShmConfig:
+			//	The host hands us a CFData describing the shared-memory mix region (or a disconnect).
+			FailWithAction(inDataSize != sizeof(CFPropertyListRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_SetPlugInPropertyData: wrong size for kKnob_CustomProperty_ShmConfig");
+			Knob_ApplyShmConfig((CFDataRef)*((CFPropertyListRef*)inData));
+			break;
+
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
 			break;
@@ -3908,16 +4081,42 @@ static OSStatus	NullAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
 	}
 	else if(inOperationID == kAudioServerPlugInIOOperationReadInput)
 	{
-		//	Return audio from the ring buffer, indexed by the input sample time. This is the
-		//	"playback" side of the loopback. The input time trails the output time, so this reads
-		//	frames written by an earlier WriteMix cycle.
 		Float32* theDestination = (Float32*)ioMainBuffer;
-		UInt64 theStartFrame = (UInt64)inIOCycleInfo->mInputTime.mSampleTime;
-		for(UInt32 theFrame = 0; theFrame < inIOBufferFrameSize; ++theFrame)
+		bool theServedFromHost = false;
+
+		//	Host override: if the Knob host has published a shared-memory mix and it holds at least a
+		//	full buffer, return that instead of the loopback. Lock-free SPSC read (driver = consumer).
+		struct KnobShmHeader* theHeader = atomic_load_explicit(&gKnob_ShmHeader, memory_order_acquire);
+		if(theHeader != NULL)
 		{
-			UInt64 theRingFrame = (theStartFrame + theFrame) % kDevice_RingBufferSize;
-			theDestination[(theFrame * 2) + 0] = gDevice_RingBuffer[(theRingFrame * 2) + 0];
-			theDestination[(theFrame * 2) + 1] = gDevice_RingBuffer[(theRingFrame * 2) + 1];
+			uint64_t theWrite = atomic_load_explicit(&theHeader->write_index, memory_order_acquire);
+			uint64_t theRead = atomic_load_explicit(&theHeader->read_index, memory_order_relaxed);
+			if((theWrite - theRead) >= (uint64_t)inIOBufferFrameSize)
+			{
+				const Float32* theShmData = (const Float32*)(theHeader + 1);
+				uint32_t theRingFrames = theHeader->ring_frames;
+				for(UInt32 theFrame = 0; theFrame < inIOBufferFrameSize; ++theFrame)
+				{
+					uint64_t thePos = (theRead + theFrame) % theRingFrames;
+					theDestination[(theFrame * 2) + 0] = theShmData[(thePos * 2) + 0];
+					theDestination[(theFrame * 2) + 1] = theShmData[(thePos * 2) + 1];
+				}
+				atomic_store_explicit(&theHeader->read_index, theRead + (uint64_t)inIOBufferFrameSize, memory_order_release);
+				theServedFromHost = true;
+			}
+		}
+
+		if(!theServedFromHost)
+		{
+			//	Fallback: internal passthrough loopback (Issue #30), indexed by the input sample time.
+			//	The input time trails the output time, so this reads frames written by an earlier WriteMix.
+			UInt64 theStartFrame = (UInt64)inIOCycleInfo->mInputTime.mSampleTime;
+			for(UInt32 theFrame = 0; theFrame < inIOBufferFrameSize; ++theFrame)
+			{
+				UInt64 theRingFrame = (theStartFrame + theFrame) % kDevice_RingBufferSize;
+				theDestination[(theFrame * 2) + 0] = gDevice_RingBuffer[(theRingFrame * 2) + 0];
+				theDestination[(theFrame * 2) + 1] = gDevice_RingBuffer[(theRingFrame * 2) + 1];
+			}
 		}
 	}
 
