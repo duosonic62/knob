@@ -197,13 +197,44 @@ struct KnobIpcStatus
 	int32_t		last_stage;			// 0 none, 1 bad/none CFData, 2 bad magic/ver/name, 3 shm_open fail, 4 fstat/size fail, 5 mmap fail, 6 bad header, 7 success
 	int32_t		last_errno;			// errno from the last failed shm_open/mmap
 	uint32_t	last_config_len;	// byte length of the last Set payload (0 ⇒ not a CFData)
+	uint32_t	xrun_count;			// cumulative ReadInput underruns while override was active (Phase 1)
 };
-static struct KnobIpcStatus					gKnob_Status					= { 0, 0, 0, 0 };
+static struct KnobIpcStatus					gKnob_Status					= { 0, 0, 0, 0, 0 };
+
+//	Phase 1: heartbeat staleness detection. Written and read exclusively by the RT (DoIOOperation) thread.
+#define KNOB_HEARTBEAT_STALE_CYCLES 200
+static uint64_t								gKnob_LastHeartbeat				= 0;
+static uint32_t								gKnob_StaleCount				= 0;
+
+//	Phase 1: cumulative ReadInput underruns (written relaxed by RT; read relaxed by control for status).
+static _Atomic uint32_t					gKnob_XrunCount					= 0;
+
+//	Phase 1: control-thread record of the currently-published mapping (base pointer + mapped size).
+//	Used by Knob_ApplyShmConfig to safely reclaim the old mapping via a grace-period dispatch.
+static struct { struct KnobShmHeader* header; size_t size; } gKnob_Mapping = { NULL, 0 };
+
+//	Schedule a munmap after a grace period long enough for any in-flight RT ReadInput to finish.
+//	Called on the control (HAL property dispatch) thread only.
+static void Knob_ScheduleMunmap(struct KnobShmHeader* inHeader, size_t inSize)
+{
+	if(inHeader == NULL || inSize == 0) { return; }
+	void* theBase = (void*)inHeader;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200LL * NSEC_PER_MSEC),
+	               dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+	               ^{ munmap(theBase, inSize); });
+}
 
 //	Apply a shm config received via the custom property (control thread, not realtime). A valid config
 //	maps the named region and publishes it; an invalid/disconnect config reverts to loopback.
 static void	Knob_ApplyShmConfig(CFDataRef inData)
 {
+	//	Capture and clear the old mapping record at the top. Every exit path below calls
+	//	Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size) to reclaim it after a
+	//	grace period, replacing the PoC intentional-leak with safe reclamation (Phase 1).
+	__typeof__(gKnob_Mapping) theOldMapping = gKnob_Mapping;
+	gKnob_Mapping.header = NULL;
+	gKnob_Mapping.size = 0;
+
 	bool theIsData = (inData != NULL) && (CFGetTypeID(inData) == CFDataGetTypeID());
 	gKnob_Status.last_config_len = theIsData ? (uint32_t)CFDataGetLength(inData) : 0;
 
@@ -229,6 +260,7 @@ static void	Knob_ApplyShmConfig(CFDataRef inData)
 		//	disconnect / invalid / version mismatch ⇒ revert to loopback
 		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
 		gKnob_Status.override_active = 0;
+		Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size);
 		return;
 	}
 
@@ -241,6 +273,7 @@ static void	Knob_ApplyShmConfig(CFDataRef inData)
 		DebugMsg("Knob_ApplyShmConfig: shm_open failed for %s (errno %d)", theConfig.name, errno);
 		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
 		gKnob_Status.override_active = 0;
+		Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size);
 		return;
 	}
 
@@ -267,6 +300,7 @@ static void	Knob_ApplyShmConfig(CFDataRef inData)
 		DebugMsg("Knob_ApplyShmConfig: fstat/mmap failed");
 		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
 		gKnob_Status.override_active = 0;
+		Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size);
 		return;
 	}
 
@@ -276,21 +310,27 @@ static void	Knob_ApplyShmConfig(CFDataRef inData)
 		(theHeader->channels != 2) ||
 		(theHeader->ring_frames == 0))
 	{
-		//	Safe to unmap: this mapping was never published to the realtime reader.
+		//	Safe to unmap immediately: this new mapping was never published to the RT reader.
 		munmap(theBase, (size_t)theStat.st_size);
 		gKnob_Status.last_stage = 6;
 		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
 		gKnob_Status.override_active = 0;
+		Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size);
 		return;
 	}
 
-	//	NOTE (PoC / Issue #31 Phase 0): any previously published mapping is intentionally leaked here
-	//	to avoid a use-after-unmap race with the realtime ReadInput thread. Phase 1 replaces this with
-	//	safe reclamation (generation/grace period).
+	//	Publish the new mapping.  Schedule cleanup of the old one after a 200 ms grace period
+	//	so any in-flight RT ReadInput that loaded the old pointer finishes safely (Phase 1).
+	gKnob_Mapping.header = theHeader;
+	gKnob_Mapping.size = (size_t)theStat.st_size;
+	//	Reset staleness state so the new mapping starts with a clean heartbeat baseline.
+	gKnob_LastHeartbeat = 0;
+	gKnob_StaleCount = 0;
 	atomic_store_explicit(&gKnob_ShmHeader, theHeader, memory_order_release);
 	gKnob_Status.last_stage = 7;
 	gKnob_Status.last_errno = 0;
 	gKnob_Status.override_active = 1;
+	Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size);
 	DebugMsg("Knob_ApplyShmConfig: host override ON (%u frames, %u Hz)", theHeader->ring_frames, theHeader->sample_rate);
 }
 static Float64								gDevice_HostTicksPerFrame		= 0.0;
@@ -1370,9 +1410,10 @@ static OSStatus	NullAudio_GetPlugInPropertyData(AudioServerPlugInDriverRef inDri
 
 		case kKnob_CustomProperty_ShmConfig:
 			//	Return a CFData carrying KnobIpcStatus diagnostics (override flag, last failure stage,
-			//	errno, last config length). Created with the Create rule; the HAL releases it.
+			//	errno, last config length, xrun count). Created with the Create rule; the HAL releases it.
 			FailWithAction(inDataSize < sizeof(CFPropertyListRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: not enough space for the return value of kKnob_CustomProperty_ShmConfig");
 			gKnob_Status.override_active = (atomic_load_explicit(&gKnob_ShmHeader, memory_order_acquire) != NULL) ? 1 : 0;
+			gKnob_Status.xrun_count = atomic_load_explicit(&gKnob_XrunCount, memory_order_relaxed);
 			*((CFDataRef*)outData) = CFDataCreate(NULL, (const UInt8*)&gKnob_Status, (CFIndex)sizeof(gKnob_Status));
 			*outDataSize = sizeof(CFPropertyListRef);
 			break;
@@ -4087,6 +4128,27 @@ static OSStatus	NullAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
 		//	Host override: if the Knob host has published a shared-memory mix and it holds at least a
 		//	full buffer, return that instead of the loopback. Lock-free SPSC read (driver = consumer).
 		struct KnobShmHeader* theHeader = atomic_load_explicit(&gKnob_ShmHeader, memory_order_acquire);
+
+		//	Phase 1: heartbeat staleness check. If the host heartbeat has not advanced for
+		//	KNOB_HEARTBEAT_STALE_CYCLES consecutive ReadInput calls, the host is likely gone —
+		//	clear the override atomically and fall back to loopback. Runs at device clock rate;
+		//	no busy poll. gKnob_LastHeartbeat/StaleCount are RT-thread-only so no lock is needed.
+		if(theHeader != NULL)
+		{
+			uint64_t theHB = atomic_load_explicit(&theHeader->heartbeat, memory_order_relaxed);
+			if(theHB != gKnob_LastHeartbeat)
+			{
+				gKnob_LastHeartbeat = theHB;
+				gKnob_StaleCount = 0;
+			}
+			else if(++gKnob_StaleCount >= KNOB_HEARTBEAT_STALE_CYCLES)
+			{
+				atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+				gKnob_StaleCount = 0;
+				theHeader = NULL;
+			}
+		}
+
 		if(theHeader != NULL)
 		{
 			uint64_t theWrite = atomic_load_explicit(&theHeader->write_index, memory_order_acquire);
@@ -4103,6 +4165,11 @@ static OSStatus	NullAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
 				}
 				atomic_store_explicit(&theHeader->read_index, theRead + (uint64_t)inIOBufferFrameSize, memory_order_release);
 				theServedFromHost = true;
+			}
+			else
+			{
+				//	Ring underflow: host override is active but the ring has insufficient data.
+				atomic_fetch_add_explicit(&gKnob_XrunCount, 1, memory_order_relaxed);
 			}
 		}
 

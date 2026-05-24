@@ -70,6 +70,7 @@ pub struct DriverStatus {
     pub last_stage: i32,
     pub last_errno: i32,
     pub last_config_len: u32,
+    pub xrun_count: u32,
 }
 
 const HEADER_SIZE: usize = std::mem::size_of::<ShmHeader>();
@@ -371,6 +372,7 @@ fn read_status() -> Result<DriverStatus, String> {
             last_stage: 0,
             last_errno: 0,
             last_config_len: 0,
+            xrun_count: 0,
         };
         std::ptr::copy_nonoverlapping(
             bytes.as_ptr(),
