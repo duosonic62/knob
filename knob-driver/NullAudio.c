@@ -213,6 +213,43 @@ static _Atomic uint32_t					gKnob_XrunCount					= 0;
 //	Used by Knob_ApplyShmConfig to safely reclaim the old mapping via a grace-period dispatch.
 static struct { struct KnobShmHeader* header; size_t size; } gKnob_Mapping = { NULL, 0 };
 
+//	Phase 1: dispatch timer that checks heartbeat staleness every second, independent of whether any
+//	IO client is active. DoIOOperation-based detection only runs during active IO, so this timer
+//	covers the common case where nothing is consuming the Knob device.
+#define KNOB_TIMER_STALE_SECONDS 3
+static dispatch_source_t					gKnob_HeartbeatTimer			= NULL;
+static uint64_t								gKnob_TimerLastHeartbeat		= 0;	// timer-callback-only
+static uint32_t								gKnob_TimerStaleSeconds			= 0;	// timer-callback-only
+
+//	Fired by gKnob_HeartbeatTimer every second. Detects host absence even when no IO client is
+//	active (DoIOOperation-based detection only runs during active IO).
+static void Knob_HeartbeatTimerFired(void)
+{
+	struct KnobShmHeader* theHeader = atomic_load_explicit(&gKnob_ShmHeader, memory_order_acquire);
+	if(theHeader == NULL)
+	{
+		//	No active mapping — reset and wait.
+		gKnob_TimerLastHeartbeat = 0;
+		gKnob_TimerStaleSeconds = 0;
+		return;
+	}
+	uint64_t theHB = atomic_load_explicit(&theHeader->heartbeat, memory_order_relaxed);
+	if(theHB != gKnob_TimerLastHeartbeat)
+	{
+		gKnob_TimerLastHeartbeat = theHB;
+		gKnob_TimerStaleSeconds = 0;
+	}
+	else if(++gKnob_TimerStaleSeconds >= KNOB_TIMER_STALE_SECONDS)
+	{
+		//	Heartbeat frozen for KNOB_TIMER_STALE_SECONDS seconds → host is gone.
+		//	Clear the override so ReadInput falls back to loopback.
+		//	Munmap cleanup happens on the next Knob_ApplyShmConfig call (reconnect).
+		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+		gKnob_TimerStaleSeconds = 0;
+		DebugMsg("Knob_HeartbeatTimerFired: host absent — override cleared");
+	}
+}
+
 //	Schedule a munmap after a grace period long enough for any in-flight RT ReadInput to finish.
 //	Called on the control (HAL property dispatch) thread only.
 static void Knob_ScheduleMunmap(struct KnobShmHeader* inHeader, size_t inSize)
@@ -620,7 +657,21 @@ static OSStatus	NullAudio_Initialize(AudioServerPlugInDriverRef inDriver, AudioS
 	Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.denom / (Float64)theTimeBaseInfo.numer;
 	theHostClockFrequency *= 1000000000.0;
 	gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
-	
+
+	//	Start the heartbeat watchdog timer. Fires every second so host absence is detected even
+	//	when no IO client is consuming the Knob device (Phase 1).
+	gKnob_HeartbeatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+	                            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+	if(gKnob_HeartbeatTimer != NULL)
+	{
+		dispatch_source_set_timer(gKnob_HeartbeatTimer,
+		                          dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+		                          1 * NSEC_PER_SEC,
+		                          100 * NSEC_PER_MSEC);
+		dispatch_source_set_event_handler(gKnob_HeartbeatTimer, ^{ Knob_HeartbeatTimerFired(); });
+		dispatch_resume(gKnob_HeartbeatTimer);
+	}
+
 Done:
 	return theAnswer;
 }
