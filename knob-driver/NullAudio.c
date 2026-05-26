@@ -210,16 +210,20 @@ static uint32_t								gKnob_StaleCount				= 0;
 static _Atomic uint32_t					gKnob_XrunCount					= 0;
 
 //	Phase 1: control-thread record of the currently-published mapping (base pointer + mapped size).
-//	Used by Knob_ApplyShmConfig to safely reclaim the old mapping via a grace-period dispatch.
+//	Used by Knob_ApplyShmConfig and Knob_HeartbeatTimerFired to reclaim old mappings.
+//	Protected by gKnob_MappingMutex (control thread + timer thread; RT thread never touches it).
 static struct { struct KnobShmHeader* header; size_t size; } gKnob_Mapping = { NULL, 0 };
+static pthread_mutex_t						gKnob_MappingMutex				= PTHREAD_MUTEX_INITIALIZER;
 
 //	Phase 1: dispatch timer that checks heartbeat staleness every second, independent of whether any
 //	IO client is active. DoIOOperation-based detection only runs during active IO, so this timer
 //	covers the common case where nothing is consuming the Knob device.
 #define KNOB_TIMER_STALE_SECONDS 3
 static dispatch_source_t					gKnob_HeartbeatTimer			= NULL;
-static uint64_t								gKnob_TimerLastHeartbeat		= 0;	// timer-callback-only
-static uint32_t								gKnob_TimerStaleSeconds			= 0;	// timer-callback-only
+static _Atomic uint64_t					gKnob_TimerLastHeartbeat		= 0;
+static _Atomic uint32_t					gKnob_TimerStaleSeconds			= 0;
+
+static void Knob_ScheduleMunmap(struct KnobShmHeader* inHeader, size_t inSize);	//	forward decl
 
 //	Fired by gKnob_HeartbeatTimer every second. Detects host absence even when no IO client is
 //	active (DoIOOperation-based detection only runs during active IO).
@@ -228,30 +232,44 @@ static void Knob_HeartbeatTimerFired(void)
 	struct KnobShmHeader* theHeader = atomic_load_explicit(&gKnob_ShmHeader, memory_order_acquire);
 	if(theHeader == NULL)
 	{
-		//	No active mapping — reset and wait.
-		gKnob_TimerLastHeartbeat = 0;
-		gKnob_TimerStaleSeconds = 0;
+		//	No active override. The RT stale path clears gKnob_ShmHeader but cannot hold the mutex,
+		//	so any orphaned mapping is drained here under the lock.
+		pthread_mutex_lock(&gKnob_MappingMutex);
+		__typeof__(gKnob_Mapping) theOrphaned = gKnob_Mapping;
+		gKnob_Mapping.header = NULL;
+		gKnob_Mapping.size = 0;
+		pthread_mutex_unlock(&gKnob_MappingMutex);
+		atomic_store_explicit(&gKnob_TimerLastHeartbeat, 0, memory_order_relaxed);
+		atomic_store_explicit(&gKnob_TimerStaleSeconds, 0, memory_order_relaxed);
+		Knob_ScheduleMunmap(theOrphaned.header, theOrphaned.size);
 		return;
 	}
-	uint64_t theHB = atomic_load_explicit(&theHeader->heartbeat, memory_order_relaxed);
-	if(theHB != gKnob_TimerLastHeartbeat)
+	uint64_t theHB   = atomic_load_explicit(&theHeader->heartbeat, memory_order_relaxed);
+	uint64_t theLastHB = atomic_load_explicit(&gKnob_TimerLastHeartbeat, memory_order_relaxed);
+	if(theHB != theLastHB)
 	{
-		gKnob_TimerLastHeartbeat = theHB;
-		gKnob_TimerStaleSeconds = 0;
+		atomic_store_explicit(&gKnob_TimerLastHeartbeat, theHB, memory_order_relaxed);
+		atomic_store_explicit(&gKnob_TimerStaleSeconds, 0, memory_order_relaxed);
 	}
-	else if(++gKnob_TimerStaleSeconds >= KNOB_TIMER_STALE_SECONDS)
+	else if(atomic_fetch_add_explicit(&gKnob_TimerStaleSeconds, 1u, memory_order_relaxed) + 1 >= KNOB_TIMER_STALE_SECONDS)
 	{
-		//	Heartbeat frozen for KNOB_TIMER_STALE_SECONDS seconds → host is gone.
-		//	Clear the override so ReadInput falls back to loopback.
-		//	Munmap cleanup happens on the next Knob_ApplyShmConfig call (reconnect).
+		//	Heartbeat frozen — host is gone. Capture and clear the mapping under the mutex,
+		//	then schedule munmap outside the lock to keep the critical section short.
+		pthread_mutex_lock(&gKnob_MappingMutex);
+		__typeof__(gKnob_Mapping) theStale = gKnob_Mapping;
+		gKnob_Mapping.header = NULL;
+		gKnob_Mapping.size = 0;
+		pthread_mutex_unlock(&gKnob_MappingMutex);
 		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
-		gKnob_TimerStaleSeconds = 0;
+		atomic_store_explicit(&gKnob_TimerStaleSeconds, 0, memory_order_relaxed);
+		Knob_ScheduleMunmap(theStale.header, theStale.size);
 		DebugMsg("Knob_HeartbeatTimerFired: host absent — override cleared");
 	}
 }
 
 //	Schedule a munmap after a grace period long enough for any in-flight RT ReadInput to finish.
-//	Called on the control (HAL property dispatch) thread only.
+//	Called on the control (HAL property dispatch) thread and the timer GCD queue.
+//	best-effort: 200ms >> one RT IO cycle (~10ms), but not formally bounded under extreme preemption.
 static void Knob_ScheduleMunmap(struct KnobShmHeader* inHeader, size_t inSize)
 {
 	if(inHeader == NULL || inSize == 0) { return; }
@@ -265,12 +283,15 @@ static void Knob_ScheduleMunmap(struct KnobShmHeader* inHeader, size_t inSize)
 //	maps the named region and publishes it; an invalid/disconnect config reverts to loopback.
 static void	Knob_ApplyShmConfig(CFDataRef inData)
 {
-	//	Capture and clear the old mapping record at the top. Every exit path below calls
-	//	Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size) to reclaim it after a
-	//	grace period, replacing the PoC intentional-leak with safe reclamation (Phase 1).
+	//	Capture and clear the old mapping record at the top under the mutex. Every exit path below
+	//	calls Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size) to reclaim it after a
+	//	grace period. The mutex serialises this with Knob_HeartbeatTimerFired so each mapping is
+	//	munmap'd exactly once (Phase 1).
+	pthread_mutex_lock(&gKnob_MappingMutex);
 	__typeof__(gKnob_Mapping) theOldMapping = gKnob_Mapping;
 	gKnob_Mapping.header = NULL;
 	gKnob_Mapping.size = 0;
+	pthread_mutex_unlock(&gKnob_MappingMutex);
 
 	bool theIsData = (inData != NULL) && (CFGetTypeID(inData) == CFDataGetTypeID());
 	gKnob_Status.last_config_len = theIsData ? (uint32_t)CFDataGetLength(inData) : 0;
@@ -358,11 +379,15 @@ static void	Knob_ApplyShmConfig(CFDataRef inData)
 
 	//	Publish the new mapping.  Schedule cleanup of the old one after a 200 ms grace period
 	//	so any in-flight RT ReadInput that loaded the old pointer finishes safely (Phase 1).
+	pthread_mutex_lock(&gKnob_MappingMutex);
 	gKnob_Mapping.header = theHeader;
 	gKnob_Mapping.size = (size_t)theStat.st_size;
-	//	Reset staleness state so the new mapping starts with a clean heartbeat baseline.
+	pthread_mutex_unlock(&gKnob_MappingMutex);
+	//	Reset RT and timer staleness counters so the new session starts with a clean baseline.
 	gKnob_LastHeartbeat = 0;
 	gKnob_StaleCount = 0;
+	atomic_store_explicit(&gKnob_TimerLastHeartbeat, 0, memory_order_relaxed);
+	atomic_store_explicit(&gKnob_TimerStaleSeconds, 0, memory_order_relaxed);
 	atomic_store_explicit(&gKnob_ShmHeader, theHeader, memory_order_release);
 	gKnob_Status.last_stage = 7;
 	gKnob_Status.last_errno = 0;
