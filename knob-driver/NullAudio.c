@@ -16,10 +16,17 @@ A minimal user-space driver.
 //	System Includes
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <dispatch/dispatch.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syslog.h>
+#include <unistd.h>
 
 //==================================================================================================
 #pragma mark -
@@ -144,6 +151,250 @@ static UInt64								gDevice_IOIsRunning				= 0;
 //	loopback ring: 2ch interleaved Float32, kDevice_RingBufferSize frames.
 //	出力に書かれた音をここへ貯め、入力 read で読み返すことで素通し loopback を実現する。
 static Float32								gDevice_RingBuffer[kDevice_RingBufferSize * 2];
+
+//==================================================================================================
+#pragma mark Knob host IPC (shared memory override)
+//==================================================================================================
+//	When the Knob host app is running it publishes a shared-memory ring of mixed PCM and hands the
+//	region's name to the driver via the custom property kKnob_CustomProperty_ShmConfig. While that
+//	mapping is active and has data, ReadInput returns the host mix instead of the internal loopback.
+//	If the host stops (the ring drains) or disconnects, ReadInput falls back to the loopback.
+
+#define										kKnob_IPC_Magic					0x4B4E4F42u		// 'KNOB'
+#define										kKnob_IPC_ProtocolVersion		1u
+#define										kKnob_ShmNameMax				64
+static const AudioObjectPropertySelector	kKnob_CustomProperty_ShmConfig	= 'Kibp';
+
+//	Payload carried by the custom property (CFData). C ABI shared with the Rust host.
+struct KnobShmConfig
+{
+	uint32_t	magic;				// kKnob_IPC_Magic
+	uint32_t	protocol_version;	// kKnob_IPC_ProtocolVersion
+	char		name[kKnob_ShmNameMax];	// POSIX shm name, e.g. "/knob.mix.1234"; name[0]==0 ⇒ disconnect
+};
+
+//	Header at the start of the shared-memory region, followed by ring_frames*channels Float32 samples.
+struct KnobShmHeader
+{
+	uint32_t			magic;				// kKnob_IPC_Magic
+	uint32_t			protocol_version;	// kKnob_IPC_ProtocolVersion
+	uint32_t			sample_rate;
+	uint32_t			channels;			// 2
+	uint32_t			ring_frames;		// ring capacity in frames
+	uint32_t			_pad;
+	_Atomic uint64_t	write_index;		// frames written by host (producer)
+	_Atomic uint64_t	read_index;			// frames read by driver (consumer)
+	_Atomic uint64_t	heartbeat;			// host bumps each write; used by Phase 1 staleness detection
+};
+
+//	Realtime ReadInput reads this atomically. Non-NULL ⇒ host override mapping is active.
+static _Atomic(struct KnobShmHeader*)		gKnob_ShmHeader					= NULL;
+
+//	Diagnostics returned to the host via the 'Kibp' Get (written on the control thread only).
+struct KnobIpcStatus
+{
+	uint32_t	override_active;	// 1 if a host mapping is currently published
+	int32_t		last_stage;			// 0 none, 1 bad/none CFData, 2 bad magic/ver/name, 3 shm_open fail, 4 fstat/size fail, 5 mmap fail, 6 bad header, 7 success
+	int32_t		last_errno;			// errno from the last failed shm_open/mmap
+	uint32_t	last_config_len;	// byte length of the last Set payload (0 ⇒ not a CFData)
+	uint32_t	xrun_count;			// cumulative ReadInput underruns while override was active (Phase 1)
+};
+static struct KnobIpcStatus					gKnob_Status					= { 0, 0, 0, 0, 0 };
+
+//	Phase 1: heartbeat staleness detection. Written and read exclusively by the RT (DoIOOperation) thread.
+#define KNOB_HEARTBEAT_STALE_CYCLES 200
+static uint64_t								gKnob_LastHeartbeat				= 0;
+static uint32_t								gKnob_StaleCount				= 0;
+
+//	Phase 1: cumulative ReadInput underruns (written relaxed by RT; read relaxed by control for status).
+static _Atomic uint32_t					gKnob_XrunCount					= 0;
+
+//	Phase 1: control-thread record of the currently-published mapping (base pointer + mapped size).
+//	Used by Knob_ApplyShmConfig and Knob_HeartbeatTimerFired to reclaim old mappings.
+//	Protected by gKnob_MappingMutex (control thread + timer thread; RT thread never touches it).
+static struct { struct KnobShmHeader* header; size_t size; } gKnob_Mapping = { NULL, 0 };
+static pthread_mutex_t						gKnob_MappingMutex				= PTHREAD_MUTEX_INITIALIZER;
+
+//	Phase 1: dispatch timer that checks heartbeat staleness every second, independent of whether any
+//	IO client is active. DoIOOperation-based detection only runs during active IO, so this timer
+//	covers the common case where nothing is consuming the Knob device.
+#define KNOB_TIMER_STALE_SECONDS 3
+static dispatch_source_t					gKnob_HeartbeatTimer			= NULL;
+static _Atomic uint64_t					gKnob_TimerLastHeartbeat		= 0;
+static _Atomic uint32_t					gKnob_TimerStaleSeconds			= 0;
+
+static void Knob_ScheduleMunmap(struct KnobShmHeader* inHeader, size_t inSize);	//	forward decl
+
+//	Fired by gKnob_HeartbeatTimer every second. Detects host absence even when no IO client is
+//	active (DoIOOperation-based detection only runs during active IO).
+static void Knob_HeartbeatTimerFired(void)
+{
+	struct KnobShmHeader* theHeader = atomic_load_explicit(&gKnob_ShmHeader, memory_order_acquire);
+	if(theHeader == NULL)
+	{
+		//	No active override. The RT stale path clears gKnob_ShmHeader but cannot hold the mutex,
+		//	so any orphaned mapping is drained here under the lock.
+		pthread_mutex_lock(&gKnob_MappingMutex);
+		__typeof__(gKnob_Mapping) theOrphaned = gKnob_Mapping;
+		gKnob_Mapping.header = NULL;
+		gKnob_Mapping.size = 0;
+		pthread_mutex_unlock(&gKnob_MappingMutex);
+		atomic_store_explicit(&gKnob_TimerLastHeartbeat, 0, memory_order_relaxed);
+		atomic_store_explicit(&gKnob_TimerStaleSeconds, 0, memory_order_relaxed);
+		Knob_ScheduleMunmap(theOrphaned.header, theOrphaned.size);
+		return;
+	}
+	uint64_t theHB   = atomic_load_explicit(&theHeader->heartbeat, memory_order_relaxed);
+	uint64_t theLastHB = atomic_load_explicit(&gKnob_TimerLastHeartbeat, memory_order_relaxed);
+	if(theHB != theLastHB)
+	{
+		atomic_store_explicit(&gKnob_TimerLastHeartbeat, theHB, memory_order_relaxed);
+		atomic_store_explicit(&gKnob_TimerStaleSeconds, 0, memory_order_relaxed);
+	}
+	else if(atomic_fetch_add_explicit(&gKnob_TimerStaleSeconds, 1u, memory_order_relaxed) + 1 >= KNOB_TIMER_STALE_SECONDS)
+	{
+		//	Heartbeat frozen — host is gone. Capture and clear the mapping under the mutex,
+		//	then schedule munmap outside the lock to keep the critical section short.
+		pthread_mutex_lock(&gKnob_MappingMutex);
+		__typeof__(gKnob_Mapping) theStale = gKnob_Mapping;
+		gKnob_Mapping.header = NULL;
+		gKnob_Mapping.size = 0;
+		pthread_mutex_unlock(&gKnob_MappingMutex);
+		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+		atomic_store_explicit(&gKnob_TimerStaleSeconds, 0, memory_order_relaxed);
+		Knob_ScheduleMunmap(theStale.header, theStale.size);
+		DebugMsg("Knob_HeartbeatTimerFired: host absent — override cleared");
+	}
+}
+
+//	Schedule a munmap after a grace period long enough for any in-flight RT ReadInput to finish.
+//	Called on the control (HAL property dispatch) thread and the timer GCD queue.
+//	best-effort: 200ms >> one RT IO cycle (~10ms), but not formally bounded under extreme preemption.
+static void Knob_ScheduleMunmap(struct KnobShmHeader* inHeader, size_t inSize)
+{
+	if(inHeader == NULL || inSize == 0) { return; }
+	void* theBase = (void*)inHeader;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200LL * NSEC_PER_MSEC),
+	               dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+	               ^{ munmap(theBase, inSize); });
+}
+
+//	Apply a shm config received via the custom property (control thread, not realtime). A valid config
+//	maps the named region and publishes it; an invalid/disconnect config reverts to loopback.
+static void	Knob_ApplyShmConfig(CFDataRef inData)
+{
+	//	Capture and clear the old mapping record at the top under the mutex. Every exit path below
+	//	calls Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size) to reclaim it after a
+	//	grace period. The mutex serialises this with Knob_HeartbeatTimerFired so each mapping is
+	//	munmap'd exactly once (Phase 1).
+	pthread_mutex_lock(&gKnob_MappingMutex);
+	__typeof__(gKnob_Mapping) theOldMapping = gKnob_Mapping;
+	gKnob_Mapping.header = NULL;
+	gKnob_Mapping.size = 0;
+	pthread_mutex_unlock(&gKnob_MappingMutex);
+
+	bool theIsData = (inData != NULL) && (CFGetTypeID(inData) == CFDataGetTypeID());
+	gKnob_Status.last_config_len = theIsData ? (uint32_t)CFDataGetLength(inData) : 0;
+
+	struct KnobShmConfig theConfig;
+	bool theValid = theIsData && (CFDataGetLength(inData) == (CFIndex)sizeof(theConfig));
+	if(theValid)
+	{
+		memcpy(&theConfig, CFDataGetBytePtr(inData), sizeof(theConfig));
+		theValid =	(theConfig.magic == kKnob_IPC_Magic) &&
+					(theConfig.protocol_version == kKnob_IPC_ProtocolVersion) &&
+					(theConfig.name[0] == '/');
+		if(!theValid)
+		{
+			gKnob_Status.last_stage = 2;
+		}
+	}
+	else
+	{
+		gKnob_Status.last_stage = 1;
+	}
+	if(!theValid)
+	{
+		//	disconnect / invalid / version mismatch ⇒ revert to loopback
+		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+		gKnob_Status.override_active = 0;
+		Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size);
+		return;
+	}
+
+	theConfig.name[kKnob_ShmNameMax - 1] = '\0';
+	int theFd = shm_open(theConfig.name, O_RDWR, 0);
+	if(theFd < 0)
+	{
+		gKnob_Status.last_stage = 3;
+		gKnob_Status.last_errno = errno;
+		DebugMsg("Knob_ApplyShmConfig: shm_open failed for %s (errno %d)", theConfig.name, errno);
+		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+		gKnob_Status.override_active = 0;
+		Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size);
+		return;
+	}
+
+	struct stat theStat;
+	void* theBase = MAP_FAILED;
+	if((fstat(theFd, &theStat) == 0) && ((size_t)theStat.st_size >= sizeof(struct KnobShmHeader)))
+	{
+		theBase = mmap(NULL, (size_t)theStat.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, theFd, 0);
+		if(theBase == MAP_FAILED)
+		{
+			gKnob_Status.last_stage = 5;
+			gKnob_Status.last_errno = errno;
+		}
+	}
+	else
+	{
+		gKnob_Status.last_stage = 4;
+		gKnob_Status.last_errno = errno;
+	}
+	close(theFd);	//	the mapping survives closing the descriptor
+
+	if(theBase == MAP_FAILED)
+	{
+		DebugMsg("Knob_ApplyShmConfig: fstat/mmap failed");
+		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+		gKnob_Status.override_active = 0;
+		Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size);
+		return;
+	}
+
+	struct KnobShmHeader* theHeader = (struct KnobShmHeader*)theBase;
+	if(	(theHeader->magic != kKnob_IPC_Magic) ||
+		(theHeader->protocol_version != kKnob_IPC_ProtocolVersion) ||
+		(theHeader->channels != 2) ||
+		(theHeader->ring_frames == 0))
+	{
+		//	Safe to unmap immediately: this new mapping was never published to the RT reader.
+		munmap(theBase, (size_t)theStat.st_size);
+		gKnob_Status.last_stage = 6;
+		atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+		gKnob_Status.override_active = 0;
+		Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size);
+		return;
+	}
+
+	//	Publish the new mapping.  Schedule cleanup of the old one after a 200 ms grace period
+	//	so any in-flight RT ReadInput that loaded the old pointer finishes safely (Phase 1).
+	pthread_mutex_lock(&gKnob_MappingMutex);
+	gKnob_Mapping.header = theHeader;
+	gKnob_Mapping.size = (size_t)theStat.st_size;
+	pthread_mutex_unlock(&gKnob_MappingMutex);
+	//	Reset RT and timer staleness counters so the new session starts with a clean baseline.
+	gKnob_LastHeartbeat = 0;
+	gKnob_StaleCount = 0;
+	atomic_store_explicit(&gKnob_TimerLastHeartbeat, 0, memory_order_relaxed);
+	atomic_store_explicit(&gKnob_TimerStaleSeconds, 0, memory_order_relaxed);
+	atomic_store_explicit(&gKnob_ShmHeader, theHeader, memory_order_release);
+	gKnob_Status.last_stage = 7;
+	gKnob_Status.last_errno = 0;
+	gKnob_Status.override_active = 1;
+	Knob_ScheduleMunmap(theOldMapping.header, theOldMapping.size);
+	DebugMsg("Knob_ApplyShmConfig: host override ON (%u frames, %u Hz)", theHeader->ring_frames, theHeader->sample_rate);
+}
 static Float64								gDevice_HostTicksPerFrame		= 0.0;
 static UInt64								gDevice_NumberTimeStamps		= 0;
 static Float64								gDevice_AnchorSampleTime		= 0.0;
@@ -431,7 +682,21 @@ static OSStatus	NullAudio_Initialize(AudioServerPlugInDriverRef inDriver, AudioS
 	Float64 theHostClockFrequency = (Float64)theTimeBaseInfo.denom / (Float64)theTimeBaseInfo.numer;
 	theHostClockFrequency *= 1000000000.0;
 	gDevice_HostTicksPerFrame = theHostClockFrequency / gDevice_SampleRate;
-	
+
+	//	Start the heartbeat watchdog timer. Fires every second so host absence is detected even
+	//	when no IO client is consuming the Knob device (Phase 1).
+	gKnob_HeartbeatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+	                            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+	if(gKnob_HeartbeatTimer != NULL)
+	{
+		dispatch_source_set_timer(gKnob_HeartbeatTimer,
+		                          dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+		                          1 * NSEC_PER_SEC,
+		                          100 * NSEC_PER_MSEC);
+		dispatch_source_set_event_handler(gKnob_HeartbeatTimer, ^{ Knob_HeartbeatTimerFired(); });
+		dispatch_resume(gKnob_HeartbeatTimer);
+	}
+
 Done:
 	return theAnswer;
 }
@@ -866,6 +1131,7 @@ static Boolean	NullAudio_HasPlugInProperty(AudioServerPlugInDriverRef inDriver, 
 		case kAudioPlugInPropertyResourceBundle:
 		case kAudioObjectPropertyCustomPropertyInfoList:
 		case kPlugIn_CustomPropertyID:
+		case kKnob_CustomProperty_ShmConfig:
 			theAnswer = true;
 			break;
 	};
@@ -910,9 +1176,10 @@ static OSStatus	NullAudio_IsPlugInPropertySettable(AudioServerPlugInDriverRef in
 			break;
 		
 		case kPlugIn_CustomPropertyID:
+		case kKnob_CustomProperty_ShmConfig:
 			*outIsSettable = true;
 			break;
-		
+
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
 			break;
@@ -997,9 +1264,9 @@ static OSStatus	NullAudio_GetPlugInPropertyDataSize(AudioServerPlugInDriverRef i
 			break;
 			
 		case kAudioObjectPropertyCustomPropertyInfoList:
-			*outDataSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+			*outDataSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			break;
-			
+
 		case kPlugIn_CustomPropertyID:
 			FailWithAction(inQualifierDataSize != sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyDataSize: the qualifier is the wrong size for kPlugIn_CustomPropertyID");
 			FailWithAction(inQualifierData == NULL, theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyDataSize: no qualifier for kPlugIn_CustomPropertyID");
@@ -1007,7 +1274,12 @@ static OSStatus	NullAudio_GetPlugInPropertyDataSize(AudioServerPlugInDriverRef i
 			CFShow(*((CFPropertyListRef*)inQualifierData));
 			*outDataSize = sizeof(CFPropertyListRef);
 			break;
-			
+
+		case kKnob_CustomProperty_ShmConfig:
+			//	Get returns a CFData status payload (see GetPlugInPropertyData).
+			*outDataSize = sizeof(CFPropertyListRef);
+			break;
+
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
 			break;
@@ -1190,16 +1462,18 @@ static OSStatus	NullAudio_GetPlugInPropertyData(AudioServerPlugInDriverRef inDri
 			
 		case kAudioObjectPropertyCustomPropertyInfoList:
 			//	This property returns an array of AudioServerPlugInCustomPropertyInfo's that
-			//	describe the type of data used by any custom properties. For this example,
-			//	the plug-in supports a single property whose data type is a CFString and
-			//	whose qualifier is a CFString.
-			FailWithAction(inDataSize < sizeof(AudioServerPlugInCustomPropertyInfo), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: not enough space for the return value of kAudioObjectPropertyCustomPropertyInfoList");
-			((AudioServerPlugInCustomPropertyInfo*)outData)->mSelector = kPlugIn_CustomPropertyID;
-			((AudioServerPlugInCustomPropertyInfo*)outData)->mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFString;
-			((AudioServerPlugInCustomPropertyInfo*)outData)->mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
-			*outDataSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+			//	describe the type of data used by any custom properties. The sample's 'PCst'
+			//	(CFString) and Knob's 'Kibp' shm-config (CFData carried as a CFPropertyList).
+			FailWithAction(inDataSize < 2 * sizeof(AudioServerPlugInCustomPropertyInfo), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: not enough space for the return value of kAudioObjectPropertyCustomPropertyInfoList");
+			((AudioServerPlugInCustomPropertyInfo*)outData)[0].mSelector = kPlugIn_CustomPropertyID;
+			((AudioServerPlugInCustomPropertyInfo*)outData)[0].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFString;
+			((AudioServerPlugInCustomPropertyInfo*)outData)[0].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+			((AudioServerPlugInCustomPropertyInfo*)outData)[1].mSelector = kKnob_CustomProperty_ShmConfig;
+			((AudioServerPlugInCustomPropertyInfo*)outData)[1].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+			((AudioServerPlugInCustomPropertyInfo*)outData)[1].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+			*outDataSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
 			break;
-			
+
 		case kPlugIn_CustomPropertyID:
 			FailWithAction(inDataSize < sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: not enough space for the return value of kPlugIn_CustomPropertyID");
 			FailWithAction(inQualifierDataSize != sizeof(CFPropertyListRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: the qualifier is the wrong size for kPlugIn_CustomPropertyID");
@@ -1209,7 +1483,17 @@ static OSStatus	NullAudio_GetPlugInPropertyData(AudioServerPlugInDriverRef inDri
 			*((CFStringRef*)outData) = CFSTR("NullAudio PlugIn Custom Property");
 			*outDataSize = sizeof(CFStringRef);
 			break;
-			
+
+		case kKnob_CustomProperty_ShmConfig:
+			//	Return a CFData carrying KnobIpcStatus diagnostics (override flag, last failure stage,
+			//	errno, last config length, xrun count). Created with the Create rule; the HAL releases it.
+			FailWithAction(inDataSize < sizeof(CFPropertyListRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_GetPlugInPropertyData: not enough space for the return value of kKnob_CustomProperty_ShmConfig");
+			gKnob_Status.override_active = (atomic_load_explicit(&gKnob_ShmHeader, memory_order_acquire) != NULL) ? 1 : 0;
+			gKnob_Status.xrun_count = atomic_load_explicit(&gKnob_XrunCount, memory_order_relaxed);
+			*((CFDataRef*)outData) = CFDataCreate(NULL, (const UInt8*)&gKnob_Status, (CFIndex)sizeof(gKnob_Status));
+			*outDataSize = sizeof(CFPropertyListRef);
+			break;
+
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
 			break;
@@ -1250,7 +1534,13 @@ static OSStatus	NullAudio_SetPlugInPropertyData(AudioServerPlugInDriverRef inDri
 			DebugMsg("NullAudio_SetPlugInPropertyData: the data passed to us was:");
 			CFShow(*((CFStringRef*)inData));
 			break;
-			
+
+		case kKnob_CustomProperty_ShmConfig:
+			//	The host hands us a CFData describing the shared-memory mix region (or a disconnect).
+			FailWithAction(inDataSize != sizeof(CFPropertyListRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "NullAudio_SetPlugInPropertyData: wrong size for kKnob_CustomProperty_ShmConfig");
+			Knob_ApplyShmConfig((CFDataRef)*((CFPropertyListRef*)inData));
+			break;
+
 		default:
 			theAnswer = kAudioHardwareUnknownPropertyError;
 			break;
@@ -3908,16 +4198,68 @@ static OSStatus	NullAudio_DoIOOperation(AudioServerPlugInDriverRef inDriver, Aud
 	}
 	else if(inOperationID == kAudioServerPlugInIOOperationReadInput)
 	{
-		//	Return audio from the ring buffer, indexed by the input sample time. This is the
-		//	"playback" side of the loopback. The input time trails the output time, so this reads
-		//	frames written by an earlier WriteMix cycle.
 		Float32* theDestination = (Float32*)ioMainBuffer;
-		UInt64 theStartFrame = (UInt64)inIOCycleInfo->mInputTime.mSampleTime;
-		for(UInt32 theFrame = 0; theFrame < inIOBufferFrameSize; ++theFrame)
+		bool theServedFromHost = false;
+
+		//	Host override: if the Knob host has published a shared-memory mix and it holds at least a
+		//	full buffer, return that instead of the loopback. Lock-free SPSC read (driver = consumer).
+		struct KnobShmHeader* theHeader = atomic_load_explicit(&gKnob_ShmHeader, memory_order_acquire);
+
+		//	Phase 1: heartbeat staleness check. If the host heartbeat has not advanced for
+		//	KNOB_HEARTBEAT_STALE_CYCLES consecutive ReadInput calls, the host is likely gone —
+		//	clear the override atomically and fall back to loopback. Runs at device clock rate;
+		//	no busy poll. gKnob_LastHeartbeat/StaleCount are RT-thread-only so no lock is needed.
+		if(theHeader != NULL)
 		{
-			UInt64 theRingFrame = (theStartFrame + theFrame) % kDevice_RingBufferSize;
-			theDestination[(theFrame * 2) + 0] = gDevice_RingBuffer[(theRingFrame * 2) + 0];
-			theDestination[(theFrame * 2) + 1] = gDevice_RingBuffer[(theRingFrame * 2) + 1];
+			uint64_t theHB = atomic_load_explicit(&theHeader->heartbeat, memory_order_relaxed);
+			if(theHB != gKnob_LastHeartbeat)
+			{
+				gKnob_LastHeartbeat = theHB;
+				gKnob_StaleCount = 0;
+			}
+			else if(++gKnob_StaleCount >= KNOB_HEARTBEAT_STALE_CYCLES)
+			{
+				atomic_store_explicit(&gKnob_ShmHeader, NULL, memory_order_release);
+				gKnob_StaleCount = 0;
+				theHeader = NULL;
+			}
+		}
+
+		if(theHeader != NULL)
+		{
+			uint64_t theWrite = atomic_load_explicit(&theHeader->write_index, memory_order_acquire);
+			uint64_t theRead = atomic_load_explicit(&theHeader->read_index, memory_order_relaxed);
+			if((theWrite - theRead) >= (uint64_t)inIOBufferFrameSize)
+			{
+				const Float32* theShmData = (const Float32*)(theHeader + 1);
+				uint32_t theRingFrames = theHeader->ring_frames;
+				for(UInt32 theFrame = 0; theFrame < inIOBufferFrameSize; ++theFrame)
+				{
+					uint64_t thePos = (theRead + theFrame) % theRingFrames;
+					theDestination[(theFrame * 2) + 0] = theShmData[(thePos * 2) + 0];
+					theDestination[(theFrame * 2) + 1] = theShmData[(thePos * 2) + 1];
+				}
+				atomic_store_explicit(&theHeader->read_index, theRead + (uint64_t)inIOBufferFrameSize, memory_order_release);
+				theServedFromHost = true;
+			}
+			else
+			{
+				//	Ring underflow: host override is active but the ring has insufficient data.
+				atomic_fetch_add_explicit(&gKnob_XrunCount, 1, memory_order_relaxed);
+			}
+		}
+
+		if(!theServedFromHost)
+		{
+			//	Fallback: internal passthrough loopback (Issue #30), indexed by the input sample time.
+			//	The input time trails the output time, so this reads frames written by an earlier WriteMix.
+			UInt64 theStartFrame = (UInt64)inIOCycleInfo->mInputTime.mSampleTime;
+			for(UInt32 theFrame = 0; theFrame < inIOBufferFrameSize; ++theFrame)
+			{
+				UInt64 theRingFrame = (theStartFrame + theFrame) % kDevice_RingBufferSize;
+				theDestination[(theFrame * 2) + 0] = gDevice_RingBuffer[(theRingFrame * 2) + 0];
+				theDestination[(theFrame * 2) + 1] = gDevice_RingBuffer[(theRingFrame * 2) + 1];
+			}
 		}
 	}
 

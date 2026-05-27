@@ -1,7 +1,10 @@
 pub mod capture;
 pub mod devices;
+pub mod driver_ipc;
 pub mod resampler;
 pub mod router;
+
+pub use driver_ipc::{DriverIpcState, DriverStatus};
 
 use arc_swap::ArcSwap;
 use serde::Serialize;

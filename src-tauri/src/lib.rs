@@ -1,7 +1,10 @@
 mod audio;
 mod settings;
 
-use audio::{AppInfo, AudioDeviceInfo, BlackHoleStatus, CaptureState, RoutingState};
+use audio::{
+    AppInfo, AudioDeviceInfo, BlackHoleStatus, CaptureState, DriverIpcState, DriverStatus,
+    RoutingState,
+};
 use settings::{Settings, SettingsState};
 use tauri::{Manager, State};
 
@@ -95,6 +98,25 @@ async fn set_master_volume(
     Ok(())
 }
 
+/// Debug-only (#31 PoC): feed a sine tone to the Knob driver via shared memory so we can verify the
+/// host→driver IPC path end-to-end (record the Knob input and confirm the tone).
+#[tauri::command]
+async fn debug_driver_sine(
+    enable: bool,
+    freq: f32,
+    ipc: State<'_, DriverIpcState>,
+) -> Result<(), String> {
+    ipc.set_sine(enable, freq)
+}
+
+/// Debug-only (#31 PoC): returns true if the driver currently has an active host-override mapping
+/// (i.e. it successfully opened the host's shared memory). Used to tell a sandbox/shm failure apart
+/// from a data-plane bug.
+#[tauri::command]
+async fn debug_driver_status(ipc: State<'_, DriverIpcState>) -> Result<DriverStatus, String> {
+    ipc.status()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
@@ -102,6 +124,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(CaptureState::default())
         .manage(RoutingState::default())
+        .manage(DriverIpcState::default())
         .setup(|app| {
             let dir = app
                 .path()
@@ -156,6 +179,8 @@ pub fn run() {
             get_settings,
             set_app_settings,
             set_master_volume,
+            debug_driver_sine,
+            debug_driver_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
